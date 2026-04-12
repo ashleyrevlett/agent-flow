@@ -270,10 +270,9 @@ Core routing function `handle_event(event_type, action, payload)`:
    - If transition returns `False`: log warning, skip dispatch (stale/duplicate/out-of-sequence mention)
 4. **Review cycle limits**: check `state.get_review_count(issue, review_type)` — if >= MAX_REVIEW_CYCLES, route to @human, transition to `escalated`
 5. For review → re-plan/re-implement handoffs: `state.increment_review_count(issue, review_type)`
-6. Fetch full context via `gh` CLI:
-   - Issue thread: `gh api repos/{owner}/{repo}/issues/{number}/comments`
-   - PR diff: `gh pr diff {number}`
-   - Issue body: from payload
+6. Fetch context via `gh` CLI (conditional by stage):
+   - Always: issue thread via `gh api repos/{owner}/{repo}/issues/{number}/comments`, issue body from payload
+   - Only for `code_review` / `implementing` stages: PR diff via `gh pr diff {number}`, PR metadata
 7. Call appropriate prompt builder → writes prompt file to `/tmp/agent-flow/prompts/{agent}-{issue_id}-{timestamp}.md`
 8. **Enqueue**: `run_id = state.enqueue_run(issue_number, repo, agent, prompt_file)`
 9. **Try to promote**: `run = state.try_promote(agent)` — if another run of this agent type is already active, returns `None` and the job stays queued
@@ -322,9 +321,10 @@ Functions:
      - @codex (reviewer): `codex -c model_instructions_file=/path/to/agent-flow/roles/reviewer.md` (operates in a manually-created worktree, see below)
   4. Wait briefly for CLI to initialize
   5. Send single-line instruction: `"Read and execute the task in {prompt_file_path}"`
-- `create_reviewer_worktree(issue_id, run_id, pr_branch)` — for @codex only, since Codex has no native `-w` flag:
+- `create_reviewer_worktree(issue_id, run_id, pr_branch)` — for @codex **code review** only, since Codex has no native `-w` flag:
   1. `git worktree add /tmp/agent-flow/worktrees/review-{issue_id}-{run_id} {pr_branch}`
   2. Returns the worktree path, which is used as the `repo_path` for `create_agent_window`
+  3. **Not called for plan reviews** — plan review uses the main repo path since no PR branch exists
 - `cleanup_worktree(worktree_path)` — called after a run completes or fails:
   1. `git worktree remove {worktree_path} --force`
   2. Only for manually-created worktrees (reviewer). Claude Code's `-w` handles its own cleanup.
@@ -339,7 +339,8 @@ Functions:
 **Worktree isolation**:
 - **@claude (planner)**: Uses Claude Code's native `-w plan-{issue_id}-{run_id}` flag. Worktree created at `<repo>/.claude/worktrees/plan-{issue_id}-{run_id}/`. Auto-cleaned up by Claude Code on exit.
 - **@implementer**: Uses Claude Code's native `-w feature-{issue_id}-{run_id}` flag. Same auto-cleanup behavior. Branch is `worktree-feature-{issue_id}-{run_id}`.
-- **@codex (reviewer)**: Worktree created manually by spawn.py via `git worktree add` on the PR branch. Codex operates in this directory so it can read the actual files on the correct branch. Cleaned up by `spawn.cleanup_worktree()` after run completes.
+- **@codex (reviewer, code review)**: Worktree created manually by spawn.py via `git worktree add` on the PR branch. Codex operates in this directory so it can read the actual files on the correct branch. Cleaned up by `spawn.cleanup_worktree()` after run completes.
+- **@codex (reviewer, plan review)**: No worktree needed — no PR or code changes exist yet. Codex operates from the main repo directory. The plan is in the issue thread, not in files.
 - The main repo checkout is never modified by agents. All work happens in worktrees.
 
 ### 6. roles/planner.md (static system prompt)
@@ -458,9 +459,17 @@ Contains the persistent role identity and protocol rules for @codex:
 
 ### 11. prompts/reviewer.py (dynamic task builder)
 
-Writes a per-invocation task file containing:
+Branches by review mode:
+
+**Plan review mode** (stage is `plan_review`):
+- Issue context: title, body, full comment thread (includes planner's plan comment)
+- Issue number and repo for `gh` commands
+- Mode flag: `review_mode: plan`
+
+**Code review mode** (stage is `code_review`):
 - PR diff and description
 - Issue number, PR number, repo for `gh` commands
+- Mode flag: `review_mode: code`
 
 Note: output contract templates, approval action, and failure rules for the reviewer are defined in `roles/reviewer.md` (see section 10 above).
 
