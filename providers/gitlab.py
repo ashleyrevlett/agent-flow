@@ -34,17 +34,22 @@ class GitLabProvider:
         self._bot_username = BOT_USERNAME
         self._base_url = GIT_BASE_URL
 
-    def _cli_env(self) -> Optional[dict[str, str]]:
-        """Return env dict with GITLAB_HOST set for self-managed, or None for default.
+    def _cli_env(self) -> dict[str, str]:
+        """Return env dict with GITLAB_TOKEN and optional GITLAB_HOST for CLI auth.
 
         glab uses GITLAB_HOST for the instance URL. The exact format accepted
         (full URL vs hostname-only) should be verified during setup — see
         PLAN-gitlab-support.md for verification steps. glab generally expects
         the full URL form (https://gitlab.example.com).
         """
-        if not self._base_url:
-            return None
-        return {**os.environ, "GITLAB_HOST": self._base_url}
+        from config import API_TOKEN
+        env = dict(os.environ)
+        # Ensure glab CLI can authenticate even if user only set API_TOKEN
+        if API_TOKEN and "GITLAB_TOKEN" not in env:
+            env["GITLAB_TOKEN"] = API_TOKEN
+        if self._base_url:
+            env["GITLAB_HOST"] = self._base_url
+        return env
 
     def _host_prefix(self) -> str:
         """Shell prefix for CLI templates embedded in agent prompts."""
@@ -54,6 +59,31 @@ class GitLabProvider:
 
     def _encoded_repo(self, repo: str) -> str:
         return urllib.parse.quote_plus(repo)
+
+    @staticmethod
+    def _parse_paginated_json(raw: str) -> list:
+        """Parse potentially concatenated JSON arrays from --paginate output.
+
+        glab --paginate may output multiple JSON arrays concatenated without
+        a separator, just like gh. This uses raw_decode to handle that.
+        """
+        if not raw:
+            return []
+        objects: list = []
+        decoder = json.JSONDecoder()
+        pos = 0
+        while pos < len(raw):
+            while pos < len(raw) and raw[pos] in " \t\n\r":
+                pos += 1
+            if pos >= len(raw):
+                break
+            obj, end = decoder.raw_decode(raw, pos)
+            if isinstance(obj, list):
+                objects.extend(obj)
+            else:
+                objects.append(obj)
+            pos = end
+        return objects
 
     # --- Trust ---
 
@@ -112,7 +142,11 @@ class GitLabProvider:
     # --- Webhook ---
 
     def verify_webhook(self, body: bytes, headers: dict[str, str]) -> bool:
+        if not self._secret:
+            return False
         token = headers.get("x-gitlab-token", "")
+        if not token:
+            return False
         return hmac.compare_digest(token, self._secret)
 
     def parse_webhook(self, body: bytes, headers: dict[str, str]) -> Optional[WebhookEvent]:
@@ -221,13 +255,8 @@ class GitLabProvider:
                  "--paginate"],
                 capture_output=True, text=True, check=True, env=self._cli_env(),
             )
-            raw = result.stdout.strip()
-            if not raw:
-                return []
-            notes = json.loads(raw)
-            if not isinstance(notes, list):
-                notes = [notes]
-        except (subprocess.CalledProcessError, json.JSONDecodeError) as exc:
+            notes = self._parse_paginated_json(result.stdout.strip())
+        except subprocess.CalledProcessError as exc:
             logger.warning("Failed to fetch notes for #%s: %s", issue_number, exc)
             return []
 
@@ -315,10 +344,8 @@ class GitLabProvider:
                  "--paginate"],
                 capture_output=True, text=True, check=True, env=self._cli_env(),
             )
-            notes = json.loads(result.stdout.strip() or "[]")
-            if not isinstance(notes, list):
-                notes = [notes]
-        except (subprocess.CalledProcessError, json.JSONDecodeError):
+            notes = self._parse_paginated_json(result.stdout.strip())
+        except subprocess.CalledProcessError:
             return False, None
 
         # Parse since_iso to datetime for reliable comparison across

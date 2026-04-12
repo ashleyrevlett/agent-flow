@@ -29,17 +29,23 @@ class GitHubProvider:
         self._base_url = GIT_BASE_URL
         self._trusted_associations = TRUSTED_AUTHOR_ASSOCIATIONS
 
-    def _cli_env(self) -> Optional[dict[str, str]]:
-        """Return env dict with GH_HOST set for GitHub Enterprise, or None for default."""
-        if not self._base_url:
-            return None
-        # gh expects hostname-only for GH_HOST
-        host = self._base_url.replace("https://", "").replace("http://", "").rstrip("/")
-        return {**os.environ, "GH_HOST": host}
+    def _cli_env(self) -> dict[str, str]:
+        """Return env dict with GH_TOKEN and optional GH_HOST for CLI auth."""
+        from config import API_TOKEN
+        env = dict(os.environ)
+        # Ensure gh CLI can authenticate even if user only set API_TOKEN
+        if API_TOKEN and "GH_TOKEN" not in env and "GITHUB_TOKEN" not in env:
+            env["GH_TOKEN"] = API_TOKEN
+        if self._base_url:
+            # gh expects hostname-only for GH_HOST
+            env["GH_HOST"] = self._base_url.replace("https://", "").replace("http://", "").rstrip("/")
+        return env
 
     # --- Webhook ---
 
     def verify_webhook(self, body: bytes, headers: dict[str, str]) -> bool:
+        if not self._secret:
+            return False
         sig_header = headers.get("x-hub-signature-256", "")
         if not sig_header.startswith("sha256="):
             return False
