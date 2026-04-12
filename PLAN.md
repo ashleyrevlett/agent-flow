@@ -203,26 +203,80 @@ Writes a prompt file containing:
 - Comment format: must start with `<!-- agent:claude -->`
 - Exact `gh` command template for posting
 
+**Output contract** — planner comment must follow this structure:
+```
+<!-- agent:claude -->
+## Plan for: {issue_title}
+[plan content — task breakdown, files to modify, approach]
+---
+STATUS: PLAN_COMPLETE
+@implementer please implement the tasks above.
+```
+
+**Failure rules** — included in every prompt:
+- If the issue lacks enough context to plan: post a comment asking for clarification, end with `@human please provide more detail`
+- If you encounter a permissions error or cannot access the repo: post `STATUS: BLOCKED` with the error, end with `@human`
+- If `gh` CLI fails: retry once, then post `STATUS: FAILED` with the error, end with `@human`
+- Never silently exit. Always post a GitHub comment with a STATUS line.
+
 ### 7. prompts/implementer.py
 
 Same structure but:
 - Role: "You are the IMPLEMENTER. Write code to fulfill the plan."
 - Includes plan text from planner's comment
 - Instructions: create feature branch, implement, commit, push, open PR with `Closes #{issue_number}`
-- Handoff: after opening PR, post a **separate issue comment** (not PR comment) ending with `@codex please review PR #N`. This ensures the handoff triggers via `issue_comment` webhook only — no double-trigger from `pull_request.opened`.
+- Handoff: after opening PR, post a **separate issue comment** (not PR comment) with the handoff. This ensures the handoff triggers via `issue_comment` webhook only — no double-trigger from `pull_request.opened`.
 - Comment tag: `<!-- agent:implementer -->`
+- **All handoff @mentions must be posted as issue comments via `gh issue comment`, never as PR comments.** This is critical for the webhook routing to work.
+
+**Output contract** — implementer issue comment must follow this structure:
+```
+<!-- agent:implementer -->
+## Implementation for: {issue_title}
+[summary of changes — files modified, approach taken]
+PR: #{pr_number}
+---
+STATUS: IMPLEMENTATION_COMPLETE
+@codex please review PR #{pr_number}.
+```
+
+**Failure rules:**
+- If the plan is unclear or contradictory: post `STATUS: BLOCKED` with specific questions, end with `@claude please clarify`
+- If tests fail after implementation: post `STATUS: TESTS_FAILING` with test output, end with `@codex please review PR #{pr_number}` (reviewer decides if it's a real issue)
+- If `git push` fails (e.g. conflicts): post `STATUS: BLOCKED` with the error, end with `@human`
+- If CI fails on the PR: post `STATUS: CI_FAILING` with relevant logs, end with `@codex please review`
+- Never silently exit. Always post a GitHub comment with a STATUS line.
 
 ### 8. prompts/reviewer.py
 
 Same structure but:
 - Role: "You are the REVIEWER. Review PRs for correctness, quality, and completeness."
 - Includes PR diff and description
-- Instructions: post review via `gh pr review`
-- Handoff options:
-  - Approve → `@claude implementation approved`
-  - Request changes → `@implementer please address the feedback above`
-  - Stuck → `@human please review`
+- Instructions: post review via `gh pr review`, then post handoff as **issue comment** via `gh issue comment`
+- **All handoff @mentions must be posted as issue comments via `gh issue comment`, never as PR comments.** This is critical for the webhook routing to work.
 - Comment tag: `<!-- agent:codex -->`
+
+**Output contract** — reviewer issue comment must follow this structure:
+```
+<!-- agent:codex -->
+## Review of PR #{pr_number}
+[review summary — what's good, what needs changes]
+---
+STATUS: APPROVED | CHANGES_REQUESTED | BLOCKED
+@claude implementation approved.
+  OR
+@implementer please address the feedback above.
+  OR
+@human please review — [reason].
+```
+
+**Approval action**: when approving, the reviewer runs `gh pr review {pr_number} --approve` AND `gh pr merge {pr_number} --squash --delete-branch`. The reviewer is responsible for merging approved PRs.
+
+**Failure rules:**
+- If the PR diff is empty or the branch is missing: post `STATUS: BLOCKED`, end with `@human`
+- If you cannot determine correctness (e.g. no tests, unclear requirements): post `STATUS: BLOCKED` with what's missing, end with `@human please review`
+- If `gh pr review` or `gh pr merge` fails: retry once, then post `STATUS: FAILED` with error, end with `@human`
+- Never silently exit. Always post a GitHub comment with a STATUS line.
 
 ### 9. monitor.py
 
@@ -251,9 +305,12 @@ Using `python-telegram-bot`:
 ### 11. CLAUDE.md for target repo
 
 Placed in the repo agents work on. Instructs Claude Code on the pipeline protocol:
-- Always post results via `gh issue comment` or `gh pr comment`
+- **All handoff comments must be issue comments** (`gh issue comment`), never PR comments. The webhook routing depends on this.
+- PR reviews go through `gh pr review` (approve/request-changes), but the handoff @mention is always a separate issue comment.
 - Always tag comments with `<!-- agent:ROLE -->`
-- Always end with exactly one @mention handoff
+- Always end with exactly one @mention handoff on the last line
+- Always include a `STATUS:` line before the handoff (PLAN_COMPLETE, IMPLEMENTATION_COMPLETE, APPROVED, CHANGES_REQUESTED, BLOCKED, FAILED)
+- Never silently exit — always post a status comment even on failure
 - Branch naming: `feature/{issue_number}-{short_desc}`
 - Commit format: conventional commits referencing issue
 - PR body: include `Closes #{issue_number}`
