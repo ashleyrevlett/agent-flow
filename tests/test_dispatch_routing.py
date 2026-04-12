@@ -247,3 +247,51 @@ class TestAuthFiltering:
             payload = self._make_payload("mybot", "NONE", body)
             dispatch._route("issue_comment", "created", payload)
             mock_handle.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# PR-branch resolution failure — zombie run prevention (Finding #1 fix)
+# ---------------------------------------------------------------------------
+
+class TestCodeReviewBranchResolution:
+    """Enqueue → branch-lookup failure must cancel the queued run, not leave it promotable."""
+
+    def _dispatch_code_review(self, pr_branch_return):
+        """Call _dispatch_agent for a code-review and return the run_id that was enqueued."""
+        captured = {}
+
+        def fake_enqueue(issue_number, repo, agent, prompt_file):
+            run_id = 42
+            captured["run_id"] = run_id
+            return run_id
+
+        with mock.patch.object(dispatch.state, "enqueue_run", side_effect=fake_enqueue), \
+             mock.patch.object(dispatch.state, "cancel_queued_run") as mock_cancel, \
+             mock.patch.object(dispatch.state, "fail_run") as mock_fail, \
+             mock.patch.object(dispatch.state, "try_promote", return_value=None), \
+             mock.patch.object(dispatch.state, "update_run_pr_branch"), \
+             mock.patch.object(dispatch, "_fetch_pr_branch", return_value=pr_branch_return), \
+             mock.patch.object(dispatch, "_fetch_pr_context", return_value=(99, "diff", "desc")), \
+             mock.patch.object(dispatch, "_fetch_comments", return_value=[]), \
+             mock.patch.object(dispatch.reviewer_prompt, "build", return_value="/tmp/prompt.md"):
+            dispatch._dispatch_agent(
+                agent="codex",
+                issue_number=10,
+                repo="owner/repo",
+                issue_title="Test",
+                issue_body="",
+                stage="code_review",
+                comment_body="",
+            )
+            return captured.get("run_id"), mock_cancel, mock_fail
+
+    def test_missing_pr_branch_cancels_queued_run(self):
+        """When _fetch_pr_branch returns None, the queued run must be cancelled."""
+        run_id, mock_cancel, mock_fail = self._dispatch_code_review(pr_branch_return=None)
+        mock_cancel.assert_called_once_with(run_id)
+        mock_fail.assert_not_called()
+
+    def test_successful_branch_does_not_cancel(self):
+        """When PR branch resolves, cancel_queued_run must not be called."""
+        _, mock_cancel, mock_fail = self._dispatch_code_review(pr_branch_return="feature/my-branch")
+        mock_cancel.assert_not_called()

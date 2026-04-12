@@ -220,6 +220,22 @@ def complete_run(run_id: int):
         _drain_queue(run["agent"])
 
 
+def cancel_queued_run(run_id: int) -> bool:
+    """Cancel a run that is still queued (never promoted to active).
+
+    fail_run() only matches status='active', so runs aborted before promotion
+    (e.g. branch-resolution failures in dispatch) must use this instead.
+    Returns True if the row was updated, False if already gone/non-queued.
+    """
+    with _conn() as con:
+        rows = con.execute(
+            "UPDATE runs SET status = 'cancelled', completed_at = CURRENT_TIMESTAMP "
+            "WHERE id = ? AND status = 'queued'",
+            (run_id,),
+        ).rowcount
+    return rows > 0
+
+
 def fail_run(run_id: int, new_status: str = "failed"):
     """Idempotent. Only transitions active → failed/stuck."""
     with _conn() as con:

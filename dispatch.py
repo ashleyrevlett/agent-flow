@@ -357,7 +357,7 @@ def _dispatch_agent(
                 "Code review dispatched for issue #%s but no pr_number provided — aborting",
                 issue_number,
             )
-            state.fail_run(run_id)
+            state.cancel_queued_run(run_id)
             return
         pr_branch = _fetch_pr_branch(repo, pr_number)
         if not pr_branch:
@@ -365,7 +365,7 @@ def _dispatch_agent(
                 "Could not resolve PR branch for PR #%s (issue #%s) — aborting code review",
                 pr_number, issue_number,
             )
-            state.fail_run(run_id)
+            state.cancel_queued_run(run_id)
             return
         state.update_run_pr_branch(run_id, pr_branch)
 
