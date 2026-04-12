@@ -1,0 +1,113 @@
+#!/usr/bin/env python3
+"""Print a digest report of the current pipeline state.
+
+Usage:
+    scripts/status
+"""
+
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from dotenv import load_dotenv
+load_dotenv()
+
+import state
+import spawn
+
+AGENTS = ("claude", "implementer", "codex")
+
+
+def main():
+    state.init_db()
+
+    # --- Agents ---
+    print("AGENTS")
+    print("-" * 50)
+    for agent in AGENTS:
+        active = [r for r in state.get_active_runs() if r["agent"] == agent]
+        queued = state.get_queue_depth(agent)
+        tripped = state.is_breaker_tripped(agent)
+
+        parts = []
+        if active:
+            parts.append(f"{len(active)} active")
+        if queued:
+            parts.append(f"{queued} queued")
+        if tripped:
+            # Get resume time
+            with state._conn() as con:
+                row = con.execute(
+                    "SELECT resume_at FROM breakers WHERE agent = ?", (agent,)
+                ).fetchone()
+            resume = row["resume_at"] if row and row["resume_at"] else "?"
+            parts.append(f"BREAKER TRIPPED (resumes {resume})")
+
+        if not parts:
+            parts.append("idle")
+
+        print(f"  {agent:14s} {', '.join(parts)}")
+
+        for r in active:
+            print(f"    └ run {r['id']} → issue #{r['issue_number']} window={r['tmux_window']}")
+
+    # --- Active issues ---
+    print()
+    print("ISSUES")
+    print("-" * 50)
+    with state._conn() as con:
+        issues = con.execute(
+            "SELECT issue_number, repo, stage, plan_review_count, code_review_count, escalated "
+            "FROM issue_stages WHERE stage NOT IN ('approved', 'closed', 'decomposed') "
+            "ORDER BY updated_at DESC"
+        ).fetchall()
+
+    if not issues:
+        print("  (no active issues)")
+    for issue in issues:
+        flags = []
+        if issue["escalated"]:
+            flags.append("ESCALATED")
+        if issue["plan_review_count"]:
+            flags.append(f"plan-reviews={issue['plan_review_count']}")
+        if issue["code_review_count"]:
+            flags.append(f"code-reviews={issue['code_review_count']}")
+        flag_str = f"  ({', '.join(flags)})" if flags else ""
+        print(f"  #{issue['issue_number']:4d}  {issue['stage']:16s}{flag_str}")
+
+    # --- tmux windows ---
+    print()
+    print("TMUX WINDOWS")
+    print("-" * 50)
+    try:
+        windows = spawn.list_windows()
+        if windows:
+            for w in windows:
+                print(f"  {w}")
+        else:
+            print("  (none)")
+    except FileNotFoundError:
+        print("  (tmux not available)")
+
+    # --- Recent completed/failed runs ---
+    print()
+    print("RECENT RUNS (last 10)")
+    print("-" * 50)
+    with state._conn() as con:
+        recent = con.execute(
+            "SELECT id, issue_number, agent, status, started_at, completed_at "
+            "FROM runs ORDER BY id DESC LIMIT 10"
+        ).fetchall()
+
+    if not recent:
+        print("  (none)")
+    for r in recent:
+        elapsed = ""
+        if r["completed_at"] and r["started_at"]:
+            elapsed = f" ({r['completed_at']})"
+        print(f"  run {r['id']:3d}  #{r['issue_number']:4d}  {r['agent']:14s}  {r['status']:10s}{elapsed}")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,50 @@
+#!/usr/bin/env python3
+"""Reset circuit breaker(s) for one or all agents.
+
+Usage:
+    scripts/reset-breaker claude        # reset one agent
+    scripts/reset-breaker codex
+    scripts/reset-breaker --all         # reset all agents
+"""
+
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from dotenv import load_dotenv
+load_dotenv()
+
+import state
+
+AGENTS = ("claude", "implementer", "codex")
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: scripts/reset-breaker <agent|--all>")
+        print(f"  agents: {', '.join(AGENTS)}")
+        sys.exit(1)
+
+    state.init_db()
+
+    arg = sys.argv[1]
+
+    if arg == "--all":
+        targets = AGENTS
+    elif arg in AGENTS:
+        targets = (arg,)
+    else:
+        print(f"Unknown agent: {arg}")
+        print(f"  valid: {', '.join(AGENTS)} or --all")
+        sys.exit(1)
+
+    for agent in targets:
+        was_tripped = state.is_breaker_tripped(agent)
+        state.reset_breaker(agent)
+        status = "was tripped, now reset" if was_tripped else "was not tripped"
+        print(f"  {agent}: {status}")
+
+
+if __name__ == "__main__":
+    main()
