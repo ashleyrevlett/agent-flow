@@ -1,82 +1,58 @@
 # Agent Flow
 
-Autonomous development pipeline driven by GitHub webhooks. A lightweight Python dispatcher routes work to AI coding agents via @mentions in GitHub comments. Agents run as interactive CLI sessions in tmux and hand off to each other automatically.
+`agent-flow` is an automated issue-to-merge pipeline for GitHub or GitLab.
 
-No orchestrator LLM. No API billing. Pure pattern matching + subscription-plan CLIs.
+It routes work across three agents:
+- `@claude` plans
+- `@implementer` implements
+- `@codex` reviews and approves/requests changes
 
-## How It Works
+The system runs locally with CLI tools (`claude`, `codex`, `gh`/`glab`) and tmux sessions, so usage stays on subscription plans rather than API orchestration billing.
 
-1. A GitHub issue is created
-2. The webhook dispatcher spawns **@claude** (planner) in a tmux window
-3. @claude posts a plan comment ending with `STATUS: PLAN_COMPLETE` and `@codex please review`
-4. **@codex** reviews the plan — approves (`STATUS: PLAN_APPROVED @implementer`) or requests changes
-5. @implementer writes code, opens a PR, and posts `STATUS: IMPLEMENTATION_COMPLETE @codex`
-6. **@codex** reviews the code — approves and merges, or requests changes (up to 3 cycles per review phase)
-7. PR merges → issue auto-closes
+## What You Get
 
-Large issues can be decomposed: @claude posts `STATUS: DECOMPOSED` and creates child issues that run the pipeline independently.
+- End-to-end workflow from issue creation to merged PR/MR
+- Automatic handoffs using `STATUS:` lines and `@mentions` in issue comments
+- Retry loops for plan/code review with escalation limits
+- Queueing, dependency handling, and crash/restart recovery
+- Optional Telegram alerts for escalations and stuck runs
+- Provider selection via `GIT_PROVIDER=github|gitlab`
 
-Humans can intervene at any point via `@human` mentions (triggers Telegram notification).
+## Quick Start
 
-## Agents
-
-| Handle | Role | CLI | Model |
-|---|---|---|---|
-| `@claude` | Planner | Claude Code | Opus |
-| `@implementer` | Implementer | Claude Code | Sonnet |
-| `@codex` | Reviewer | Codex CLI | Codex |
-
-All use subscription-plan billing, not API keys.
-
-## Architecture
-
-```
-GitHub Webhook → FastAPI (webhook.py)
-                    │
-                    ├── dispatch.py   — comment routing, stage machine calls
-                    ├── state.py      — SQLite stage/run/circuit-breaker state
-                    ├── spawn.py      — tmux window + git worktree management
-                    ├── monitor.py    — async health-check + completion polling
-                    └── notifications.py — Telegram alerts + /status bot
-```
-
-GitHub comments are the message bus. Agents self-direct handoffs via @mentions.
-
-## Setup
-
-### Prerequisites
-
-- Python 3.11+
-- tmux
-- [gh CLI](https://cli.github.com/) (authenticated)
-- [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) (logged in with subscription)
-- [Codex CLI](https://github.com/openai/codex) (logged in with subscription)
-- ngrok or Cloudflare tunnel (for local webhook delivery)
-
-### Install
-
+1. Install dependencies:
 ```sh
 pip install -r requirements.txt
-cp .env.example .env
-# Edit .env with your tokens and config
 ```
-
-### Run
-
+2. Configure env:
+```sh
+cp .env.example .env
+```
+3. Set at least:
+- `GIT_PROVIDER` (`github` or `gitlab`)
+- `WEBHOOK_SECRET`
+- `GIT_REPO`
+- `REPO_LOCAL_PATH`
+4. Run:
 ```sh
 python main.py
 ```
+5. Point your provider webhook to:
+- `https://<your-tunnel-or-host>/webhook`
 
-Starts the webhook server on port 8000, the tmux monitor loop, and the Telegram bot.
+## Requirements
 
-### Configure GitHub Webhook
+- Python 3.11+
+- tmux
+- Claude Code CLI
+- Codex CLI
+- GitHub CLI (`gh`) when `GIT_PROVIDER=github`
+- GitLab CLI (`glab`) when `GIT_PROVIDER=gitlab`
 
-Point your repo's webhook at your server:
+## Docs
 
-- **URL**: `https://your-tunnel.ngrok.io/webhook`
-- **Content type**: `application/json`
-- **Secret**: match your `GITHUB_WEBHOOK_SECRET`
-- **Events**: Issues, Issue comments, Pull requests, Pull request reviews, Workflow runs
+- Developer spec and architecture: `SPEC.md`
+- Example configuration: `.env.example`
 
 ## License
 
