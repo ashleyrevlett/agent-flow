@@ -348,11 +348,26 @@ def _dispatch_agent(
     run_id = state.enqueue_run(issue_number, repo, agent, prompt_file)
     logger.info("Enqueued run %d for %s on issue #%s", run_id, agent, issue_number)
 
-    # Store pr_branch so the reviewer worktree targets the right branch
-    if pr_number is not None and agent == "codex" and stage == "code_review":
+    # Store pr_branch so the reviewer worktree targets the right branch.
+    # For code review this is mandatory — fail fast rather than silently
+    # reviewing detached HEAD on the wrong commit.
+    if agent == "codex" and stage == "code_review":
+        if pr_number is None:
+            logger.error(
+                "Code review dispatched for issue #%s but no pr_number provided — aborting",
+                issue_number,
+            )
+            state.fail_run(run_id)
+            return
         pr_branch = _fetch_pr_branch(repo, pr_number)
-        if pr_branch:
-            state.update_run_pr_branch(run_id, pr_branch)
+        if not pr_branch:
+            logger.error(
+                "Could not resolve PR branch for PR #%s (issue #%s) — aborting code review",
+                pr_number, issue_number,
+            )
+            state.fail_run(run_id)
+            return
+        state.update_run_pr_branch(run_id, pr_branch)
 
     # Try to promote
     run = state.try_promote(agent)

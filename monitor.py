@@ -133,6 +133,10 @@ async def _poll():
             if _RATE_LIMIT_PATTERNS.search(pane_content):
                 logger.warning("Circuit breaker trip: rate limit/auth error for %s", agent)
                 state.trip_breaker(agent)
+                # Mark run failed so try_promote() is not permanently blocked
+                # waiting for an active run that will never complete.
+                state.fail_run(run_id, new_status="failed")
+                _cleanup_run_worktree(run)
                 resume_at = _get_breaker_resume(agent)
                 telegram.send_notification(
                     f"Circuit breaker tripped for @{agent} — rate limited. Resuming at {resume_at}.",
