@@ -217,8 +217,8 @@ Functions:
 - `enqueue_run(issue_number, repo, agent, prompt_file)` — insert new run with status `queued`, returns `run_id`. Called before any spawn attempt.
 - `try_promote(agent)` — atomically: if no `active` run exists for this agent type, find the oldest `queued` run **whose issue has no unsatisfied dependencies** (`is_blocked() == False`), promote it to `active`, and return it. If an `active` run exists or all queued runs are blocked, return `None`. Uses `UPDATE ... WHERE` with subqueries to prevent races.
 - `update_run_window(run_id, tmux_window)` — set window name after successful spawn
-- `complete_run(run_id)` — **idempotent**: no-op if status is not `active`. Otherwise mark `completed`, set `completed_at`, call `spawn.cleanup_worktree()` if `worktree_path` is set, then call `try_promote(agent)` to auto-dequeue the next job. Safe to call multiple times (monitor may detect completion via both pane exit and GitHub comment).
-- `fail_run(run_id, status)` — **idempotent**: no-op if status is not `active`. Otherwise mark `failed` or `stuck`, call `spawn.cleanup_worktree()` if `worktree_path` is set, then call `try_promote(agent)` to auto-dequeue
+- `complete_run(run_id)` — **idempotent** via `UPDATE runs SET status='completed', completed_at=NOW() WHERE id=? AND status='active'`. If 0 rows affected (already completed/failed/stuck), returns early — no cleanup, no queue drain. Safe to call multiple times (monitor may detect completion via both pane exit and GitHub comment).
+- `fail_run(run_id, new_status)` — **idempotent** via `UPDATE runs SET status=?, completed_at=NOW() WHERE id=? AND status='active'`. If 0 rows affected, returns early. Same guard as `complete_run`.
 - `get_active_runs()` — all runs with status `active`, for monitor to reconnect after restart
 - `get_queue_depth(agent=None)` — count of `queued` runs, optionally filtered by agent type (for /status command)
 - `is_duplicate(delivery_id)` — atomic `INSERT ... ON CONFLICT DO NOTHING`, returns `True` if 0 rows affected (already seen). No separate check step — single statement eliminates race window under concurrent webhook handling.
