@@ -228,16 +228,16 @@ Functions:
 - `transition(issue_number, repo, expected_stage, new_stage)` — atomic `UPDATE ... WHERE stage = expected_stage`. Returns `True` if transition succeeded, `False` if current stage didn't match (invalid transition). This is the guard that prevents out-of-sequence agent invocations.
 - Valid transitions:
   ```
-  open → planning                (issues.opened → dispatch @claude)
-  planning → plan_review         (planner posts PLAN_COMPLETE → @codex)
-  planning → decomposed          (planner posts DECOMPOSED — terminal)
-  plan_review → planning         (reviewer requests plan changes → @claude)
-  plan_review → implementing     (reviewer approves plan → @implementer)
-  implementing → code_review     (implementer posts IMPLEMENTATION_COMPLETE → @codex)
-  code_review → implementing     (reviewer requests code changes → @implementer)
-  code_review → approved         (reviewer approves + merges — terminal)
-- `escalate(issue_number, repo)` — separate function, not `transition()`. Sets stage to `escalated` regardless of current stage. This avoids conflicting with the strict expected-stage contract of `transition()`.
+  open → planning                (issues.opened)
+  planning → plan_review         (PLAN_COMPLETE → @codex)
+  planning → decomposed          (DECOMPOSED — terminal)
+  plan_review → planning         (PLAN_CHANGES_REQUESTED → @claude)
+  plan_review → implementing     (PLAN_APPROVED → @implementer)
+  implementing → code_review     (IMPLEMENTATION_COMPLETE or CONFLICTS → @codex)
+  code_review → implementing     (CHANGES_REQUESTED or CI_FAILING → @implementer)
+  code_review → approved         (APPROVED — terminal, handled by monitor not dispatch)
   ```
+- `escalate(issue_number, repo)` — separate function, not `transition()`. Sets stage to `escalated` regardless of current stage. This avoids conflicting with the strict expected-stage contract of `transition()`.
 - `get_review_count(issue_number, repo, review_type)` — returns plan_review_count or code_review_count
 - `increment_review_count(issue_number, repo, review_type)` — bump the appropriate counter
 - `prune_deliveries(max_age_hours=24)` — cleanup old dedup entries. Default 24h is conservative; GitHub can redeliver webhooks for up to several hours after initial failure. Configurable via `DEDUP_TTL_HOURS` env var.
@@ -259,15 +259,19 @@ Core routing function `handle_event(event_type, action, payload)`:
 
 1. Check `state.is_duplicate(delivery_id)` — skip if seen
 2. Determine target agent from event type + @mention
-3. **Stage validation**: determine the expected transition and attempt it atomically:
-   - `issues.opened` + @claude: `transition(issue, "open", "planning")` — reject if not `open`
-   - PLAN_COMPLETE + @codex: `transition(issue, "planning", "plan_review")` — reject if not `planning`
-   - PLAN_APPROVED + @implementer: `transition(issue, "plan_review", "implementing")` — reject if not `plan_review`
-   - PLAN CHANGES_REQUESTED + @claude: `transition(issue, "plan_review", "planning")` — reject if not `plan_review`
-   - IMPLEMENTATION_COMPLETE + @codex: `transition(issue, "implementing", "code_review")` — reject if not `implementing`
-   - CODE CHANGES_REQUESTED + @implementer: `transition(issue, "code_review", "implementing")` — reject if not `code_review`
-   - APPROVED: `transition(issue, "code_review", "approved")` — reject if not `code_review`
-   - If transition returns `False`: log warning, skip dispatch (stale/duplicate/out-of-sequence mention)
+3. **Stage validation**: parse the `STATUS:` line from the triggering comment, determine the expected transition, and attempt it atomically. Exact status tokens and their transitions:
+   - `issues.opened` (no status): `transition(issue, "open", "planning")` → dispatch @claude
+   - `STATUS: PLAN_COMPLETE` + @codex: `transition(issue, "planning", "plan_review")` → dispatch @codex (plan review)
+   - `STATUS: DECOMPOSED` (no @mention): `transition(issue, "planning", "decomposed")` → no dispatch (terminal)
+   - `STATUS: PLAN_APPROVED` + @implementer: `transition(issue, "plan_review", "implementing")` → dispatch @implementer
+   - `STATUS: PLAN_CHANGES_REQUESTED` + @claude: `transition(issue, "plan_review", "planning")` → dispatch @claude
+   - `STATUS: IMPLEMENTATION_COMPLETE` + @codex: `transition(issue, "implementing", "code_review")` → dispatch @codex (code review)
+   - `STATUS: CHANGES_REQUESTED` + @implementer: `transition(issue, "code_review", "implementing")` → dispatch @implementer
+   - `STATUS: CI_FAILING` + @implementer: `transition(issue, "code_review", "implementing")` → dispatch @implementer (same transition as CHANGES_REQUESTED — reviewer is sending work back)
+   - `STATUS: APPROVED` (no @mention): **not handled by dispatch** — handled by monitor (see below)
+   - `STATUS: BLOCKED` / `STATUS: FAILED` + @human: `escalate(issue)` → Telegram notification
+   - `STATUS: CONFLICTS` + @codex: `transition(issue, "implementing", "code_review")` → dispatch @codex
+   - If transition returns `False`: log warning, skip dispatch (stale/duplicate/out-of-sequence)
 4. **Review cycle limits**: check `state.get_review_count(issue, review_type)` — if >= MAX_REVIEW_CYCLES, route to @human, transition to `escalated`
 5. For review → re-plan/re-implement handoffs: `state.increment_review_count(issue, review_type)`
 6. Fetch context via `gh` CLI (conditional by stage):
@@ -488,9 +492,16 @@ Every `MONITOR_POLL_SECONDS`:
 
 For Claude Code (alt-screen buffer): also poll GitHub for new comments tagged with `<!-- agent:X -->` as primary completion signal.
 
+**APPROVED detection**: monitor polls for `<!-- agent:codex -->` comments containing `STATUS: APPROVED`. Since APPROVED has no @mention, dispatch never sees it. When monitor detects this comment:
+1. Call `state.transition(issue, "code_review", "approved")`
+2. Call `state.complete_run(run_id)` for the reviewer run
+3. Log completion — pipeline for this issue is done
+
 On startup: check `state.get_active_runs()` against actual tmux windows. Mark orphaned runs as failed via `state.fail_run()` (which auto-drains the queue for that agent type).
 
 On run completion detected (agent posted to GitHub / pane exited): call `state.complete_run(run_id)` which auto-promotes the next queued job.
+
+**DECOMPOSED detection**: similarly, monitor detects `STATUS: DECOMPOSED` comments (no @mention). Calls `state.transition(issue, "planning", "decomposed")` and `state.complete_run(run_id)` for the planner run.
 
 ### 13. telegram.py
 
