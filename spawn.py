@@ -7,6 +7,7 @@ import subprocess
 import time
 import logging
 from pathlib import Path
+from typing import Optional
 
 from config import TMUX_SESSION_NAME, ROLES_DIR, WORKTREE_DIR
 
@@ -63,11 +64,17 @@ def create_reviewer_worktree(issue_id: str, run_id: int, pr_branch: str | None, 
     return worktree_path
 
 
-def cleanup_worktree(worktree_path: str):
-    """Remove a manually-created worktree (reviewer only)."""
+def cleanup_worktree(worktree_path: str, repo_path: Optional[str] = None):
+    """Remove a manually-created worktree (reviewer only).
+
+    repo_path: the main repo clone directory. Required so git -C works from
+    any cwd. If not provided, falls back to cwd (less reliable).
+    """
+    from config import REPO_LOCAL_PATH
+    effective_repo = repo_path or REPO_LOCAL_PATH
     try:
         subprocess.run(
-            ["git", "worktree", "remove", worktree_path, "--force"],
+            ["git", "-C", effective_repo, "worktree", "remove", worktree_path, "--force"],
             check=True,
         )
         logger.info("Cleaned up worktree: %s", worktree_path)

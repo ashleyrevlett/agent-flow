@@ -13,7 +13,7 @@ from typing import Optional
 
 import state
 import spawn
-import telegram
+import notifications as telegram
 from config import (
     GITHUB_REPO,
     MONITOR_POLL_SECONDS,
@@ -149,7 +149,9 @@ async def _poll():
 
         # --- GitHub comment polling (primary completion signal) ---
         # Claude Code uses alt-screen; pane exit is unreliable. Poll GitHub instead.
-        completed, status_token = await _check_github_completion(repo, issue_number, agent)
+        completed, status_token = await _check_github_completion(
+            repo, issue_number, agent, run["started_at"]
+        )
         if completed:
             logger.info("Run %d completion detected via GitHub comment (STATUS: %s)", run_id, status_token)
             _handle_completion(run_id, agent, issue_number, repo, status_token, run["worktree_path"])
@@ -176,20 +178,26 @@ def _handle_completion(run_id: int, agent: str, issue_number: int, repo: str, st
 
     # Clean up reviewer worktree
     if worktree_path and agent == "codex":
-        spawn.cleanup_worktree(worktree_path)
+        from config import REPO_LOCAL_PATH
+        spawn.cleanup_worktree(worktree_path, repo_path=REPO_LOCAL_PATH)
 
 
 async def _check_github_completion(
-    repo: str, issue_number: int, agent: str
+    repo: str, issue_number: int, agent: str, run_started_at: str
 ) -> tuple[bool, Optional[str]]:
     """
-    Poll GitHub for a new completion comment from this agent on this issue.
-    Returns (completed, status_token).
+    Poll GitHub for a completion comment from this agent on this issue that
+    was posted AFTER the run started. Returns (completed, status_token).
+
+    Guards against stale comments from prior runs on the same issue
+    prematurely completing a new run.
     """
     try:
         result = subprocess.run(
             ["gh", "api", f"repos/{repo}/issues/{issue_number}/comments",
-             "--jq", f'[.[] | select(.body | contains("<!-- agent:{agent} -->"))] | last'],
+             "--jq",
+             f'[.[] | select(.body | contains("<!-- agent:{agent} -->"))'
+             f' | select(.created_at > "{run_started_at}")] | last'],
             capture_output=True, text=True, check=True,
         )
         raw = result.stdout.strip()

@@ -16,6 +16,16 @@ os.makedirs(os.path.dirname(SQLITE_DB_PATH), exist_ok=True)
 
 _lock = threading.Lock()
 
+# Allowed stage transitions. Only these forward/backward edges are valid;
+# escalated is set via escalate() and never via transition().
+_VALID_TRANSITIONS: dict[str, set[str]] = {
+    "open":         {"planning"},
+    "planning":     {"plan_review", "decomposed"},
+    "plan_review":  {"implementing", "planning"},
+    "implementing": {"code_review"},
+    "code_review":  {"approved", "implementing"},
+}
+
 
 @contextmanager
 def _conn():
@@ -299,7 +309,10 @@ def get_stage(issue_number: int, repo: str) -> str:
 
 
 def transition(issue_number: int, repo: str, expected_stage: str, new_stage: str) -> bool:
-    """Atomic stage transition. Returns True on success, False if current stage didn't match."""
+    """Atomic stage transition. Returns True on success, False if the current stage
+    didn't match expected_stage or the edge is not in the valid transitions graph."""
+    if new_stage not in _VALID_TRANSITIONS.get(expected_stage, set()):
+        return False
     with _conn() as con:
         # Ensure row exists
         con.execute(

@@ -21,7 +21,7 @@ from prompts import planner as planner_prompt
 from prompts import implementer as implementer_prompt
 from prompts import reviewer as reviewer_prompt
 import spawn
-import telegram
+import notifications as telegram
 
 logger = logging.getLogger(__name__)
 
@@ -116,16 +116,33 @@ def _route(event_type: str, action: str, payload: dict):
         author_association = comment.get("author_association", "")
         is_agent_comment = "<!-- agent:" in comment_body
 
-        # Self-trigger filter
-        if commenter == BOT_GITHUB_USERNAME:
-            logger.info("Ignoring self-comment on #%s", issue_number)
-            return
-
         # Parse @mention from last non-empty line
         mention = _parse_mention(comment_body)
 
-        # For human-authored comments: require trusted collaborator AND a mention
-        if not is_agent_comment:
+        if is_agent_comment:
+            # Agent-tagged comments drive pipeline handoffs.
+            # Accept only from BOT_GITHUB_USERNAME (our bot) OR trusted collaborators.
+            # This prevents external users from spoofing <!-- agent:... --> tags.
+            is_trusted = (
+                (BOT_GITHUB_USERNAME and commenter == BOT_GITHUB_USERNAME)
+                or author_association in TRUSTED_AUTHOR_ASSOCIATIONS
+            )
+            if not is_trusted:
+                logger.info(
+                    "Ignoring agent-tagged comment from untrusted user %s (%s) on #%s",
+                    commenter, author_association, issue_number,
+                )
+                return
+            # Ignore bare agent-tagged comments with no STATUS and no mention
+            status_check = _parse_status(comment_body)
+            if mention is None and status_check is None:
+                return
+        else:
+            # Human-authored comments: require trusted collaborator AND a mention.
+            # Filter bot's own non-agent comments to prevent loops.
+            if commenter == BOT_GITHUB_USERNAME:
+                logger.info("Ignoring non-agent self-comment on #%s", issue_number)
+                return
             if mention is None:
                 return
             if author_association not in TRUSTED_AUTHOR_ASSOCIATIONS:
@@ -133,12 +150,6 @@ def _route(event_type: str, action: str, payload: dict):
                     "Ignoring @%s mention from untrusted user %s (%s)",
                     mention, commenter, author_association,
                 )
-                return
-        else:
-            # Agent comments: route even without mention (e.g. STATUS: DECOMPOSED, STATUS: APPROVED)
-            # but only if there's a STATUS token or a mention — ignore bare agent-tagged comments
-            status_check = _parse_status(comment_body)
-            if mention is None and status_check is None:
                 return
 
         # Parse STATUS token
@@ -197,13 +208,16 @@ def _handle_comment(
         ("CONFLICTS", "codex"):                   ("implementing",  "code_review",   "codex",       "code"),
         ("CHANGES_REQUESTED", "implementer"):     ("code_review",   "implementing",  "implementer", None),
         ("CI_FAILING", "implementer"):            ("code_review",   "implementing",  "implementer", None),
+        # TESTS_FAILING → route to codex for code review (reviewer decides if real issue)
+        ("TESTS_FAILING", "codex"):              ("implementing",  "code_review",   "codex",       "code"),
+        # BLOCKED from implementer → planner to clarify ambiguous plan
+        ("BLOCKED", "claude"):                   ("implementing",  "planning",      "claude",      None),
     }
-    # Escalations
-    escalation_statuses = {"BLOCKED", "FAILED", "TESTS_FAILING"}
 
     key = (status, mention)
 
-    if status in escalation_statuses or mention == "human":
+    # Escalate to human when explicitly requested or on unrecoverable failures
+    if mention == "human" or (status == "FAILED" and mention != "codex"):
         state.escalate(issue_number, repo)
         telegram.send_notification(
             f"Escalated to @human: issue #{issue_number} in {repo}. Status: {status}",
@@ -330,6 +344,12 @@ def _dispatch_agent(
     run_id = state.enqueue_run(issue_number, repo, agent, prompt_file)
     logger.info("Enqueued run %d for %s on issue #%s", run_id, agent, issue_number)
 
+    # Store pr_branch so the reviewer worktree targets the right branch
+    if pr_number is not None and agent == "codex" and stage == "code_review":
+        pr_branch = _fetch_pr_branch(repo, pr_number)
+        if pr_branch:
+            state.update_run_pr_branch(run_id, pr_branch)
+
     # Try to promote
     run = state.try_promote(agent)
     if run is None:
@@ -337,18 +357,19 @@ def _dispatch_agent(
         return
 
     # Spawn
-    _spawn_run(run, repo)
+    _spawn_run(run)
 
 
-def _spawn_run(run, repo: str):
+def _spawn_run(run):
     """Spawn a promoted run into a tmux window."""
+    from config import REPO_LOCAL_PATH
     run_id = run["id"]
     agent = run["agent"]
     issue_number = run["issue_number"]
     issue_id = str(issue_number)
     prompt_file = run["prompt_file"]
 
-    # Determine repo_path (worktree for codex, main repo for others)
+    # Determine repo_path (worktree for codex, local clone for others)
     if agent == "codex":
         pr_branch = run["pr_branch"]
         try:
@@ -356,7 +377,7 @@ def _spawn_run(run, repo: str):
                 issue_id=issue_id,
                 run_id=run_id,
                 pr_branch=pr_branch,
-                repo_path=repo,
+                repo_path=REPO_LOCAL_PATH,  # always the local clone, not GitHub repo name
             )
         except Exception:
             logger.exception("Failed to create reviewer worktree for run %d", run_id)
@@ -365,7 +386,6 @@ def _spawn_run(run, repo: str):
         state.update_run_worktree(run_id, worktree_path)
         repo_path = worktree_path
     else:
-        from config import REPO_LOCAL_PATH
         repo_path = REPO_LOCAL_PATH
 
     window_name = spawn.create_agent_window(
@@ -388,8 +408,7 @@ def drain_queue(agent: str):
     run = state.try_promote(agent)
     if run is None:
         return
-    repo = run["repo"]
-    _spawn_run(run, repo)
+    _spawn_run(run)
 
 
 # ---------------------------------------------------------------------------
@@ -397,25 +416,39 @@ def drain_queue(agent: str):
 # ---------------------------------------------------------------------------
 
 def _fetch_comments(repo: str, issue_number: int) -> list[dict]:
+    """Fetch all comments for an issue as a list of dicts."""
     import json
     try:
+        # Use --paginate without --jq so output is a valid JSON array per page.
+        # With --paginate, gh concatenates pages — output may be multiple arrays.
+        # Use --jq '.' at the array level to flatten into newline-separated objects.
         result = subprocess.run(
             ["gh", "api", f"repos/{repo}/issues/{issue_number}/comments",
-             "--paginate", "--jq", ".[]"],
+             "--paginate"],
             capture_output=True, text=True, check=True,
         )
-        # gh --jq .[] returns one JSON object per line
+        raw = result.stdout.strip()
+        if not raw:
+            return []
+        # gh --paginate outputs one JSON array per page, concatenated.
+        # Wrap in a single parse by collecting all objects via decoder.
         objects = []
-        for line in result.stdout.splitlines():
-            line = line.strip()
-            if line:
-                try:
-                    objects.append(json.loads(line))
-                except json.JSONDecodeError:
-                    pass
+        decoder = json.JSONDecoder()
+        pos = 0
+        while pos < len(raw):
+            while pos < len(raw) and raw[pos] in " \t\n\r":
+                pos += 1
+            if pos >= len(raw):
+                break
+            obj, end = decoder.raw_decode(raw, pos)
+            if isinstance(obj, list):
+                objects.extend(obj)
+            else:
+                objects.append(obj)
+            pos = end
         return objects
-    except subprocess.CalledProcessError as exc:
-        logger.warning("Failed to fetch comments for #%s: %s", issue_number, exc.stderr)
+    except (subprocess.CalledProcessError, json.JSONDecodeError) as exc:
+        logger.warning("Failed to fetch comments for #%s: %s", issue_number, exc)
         return []
 
 
@@ -425,7 +458,7 @@ def _fetch_pr_context(repo: str, issue_number: int) -> tuple[Optional[int], Opti
     try:
         result = subprocess.run(
             ["gh", "pr", "list", "--repo", repo,
-             "--search", f"Closes #{issue_number}", "--json", "number,title,body"],
+             "--search", f"Closes #{issue_number}", "--json", "number,title,body,headRefName"],
             capture_output=True, text=True, check=True,
         )
         prs = json.loads(result.stdout or "[]")
@@ -443,6 +476,22 @@ def _fetch_pr_context(repo: str, issue_number: int) -> tuple[Optional[int], Opti
     except subprocess.CalledProcessError as exc:
         logger.warning("Failed to fetch PR context for #%s: %s", issue_number, exc.stderr)
         return None, None, None
+
+
+def _fetch_pr_branch(repo: str, pr_number: int) -> Optional[str]:
+    """Return the head branch name for a given PR number."""
+    import json
+    try:
+        result = subprocess.run(
+            ["gh", "pr", "view", str(pr_number), "--repo", repo,
+             "--json", "headRefName"],
+            capture_output=True, text=True, check=True,
+        )
+        data = json.loads(result.stdout)
+        return data.get("headRefName")
+    except (subprocess.CalledProcessError, json.JSONDecodeError) as exc:
+        logger.warning("Failed to fetch PR branch for PR #%s: %s", pr_number, exc)
+        return None
 
 
 # ---------------------------------------------------------------------------

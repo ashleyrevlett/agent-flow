@@ -9,7 +9,7 @@ import uvicorn
 
 import state
 import spawn
-import telegram
+import notifications as telegram
 from config import TMUX_SESSION_NAME
 from webhook import app
 
