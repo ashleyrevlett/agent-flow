@@ -143,6 +143,8 @@ CREATE TABLE runs (
     tmux_window TEXT,              -- window name for monitoring
     status TEXT NOT NULL,          -- queued, active, completed, failed, stuck
     prompt_file TEXT,              -- path to task prompt file (needed to spawn from queue)
+    worktree_path TEXT,            -- path to worktree (for cleanup on completion)
+    pr_branch TEXT,                -- branch name (needed for reviewer worktree creation)
     started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     completed_at TIMESTAMP
 );
@@ -197,8 +199,8 @@ Functions:
 - `enqueue_run(issue_number, repo, agent, prompt_file)` — insert new run with status `queued`, returns `run_id`. Called before any spawn attempt.
 - `try_promote(agent)` — atomically: if no `active` run exists for this agent type, find the oldest `queued` run **whose issue has no unsatisfied dependencies** (`is_blocked() == False`), promote it to `active`, and return it. If an `active` run exists or all queued runs are blocked, return `None`. Uses `UPDATE ... WHERE` with subqueries to prevent races.
 - `update_run_window(run_id, tmux_window)` — set window name after successful spawn
-- `complete_run(run_id)` — mark `completed`, set `completed_at`, then call `try_promote(agent)` to auto-dequeue the next job
-- `fail_run(run_id, status)` — mark `failed` or `stuck`, then call `try_promote(agent)` to auto-dequeue
+- `complete_run(run_id)` — mark `completed`, set `completed_at`, call `spawn.cleanup_worktree()` if `worktree_path` is set, then call `try_promote(agent)` to auto-dequeue the next job
+- `fail_run(run_id, status)` — mark `failed` or `stuck`, call `spawn.cleanup_worktree()` if `worktree_path` is set, then call `try_promote(agent)` to auto-dequeue
 - `get_active_runs()` — all runs with status `active`, for monitor to reconnect after restart
 - `get_queue_depth(agent=None)` — count of `queued` runs, optionally filtered by agent type (for /status command)
 - `is_duplicate(delivery_id)` — atomic `INSERT ... ON CONFLICT DO NOTHING`, returns `True` if 0 rows affected (already seen). No separate check step — single statement eliminates race window under concurrent webhook handling.
@@ -258,13 +260,19 @@ Functions:
 - `ensure_session()` — create master tmux session if not exists
 - `create_agent_window(run_id, agent_name, issue_id, cli_command, prompt_file_path, repo_path)`:
   1. Create named window: `tmux new-window -t SESSION -n "{agent}-{issue_id}-{run_id}"` (run_id from state.db ensures uniqueness across retries)
-  2. Send `cd {repo_path}` via send-keys
+  2. Send `cd {repo_path}` via send-keys (this is the worktree path, not the main repo)
   3. Send CLI command via send-keys with role injection:
-     - @claude: `claude --dangerously-skip-permissions --append-system-prompt-file /path/to/agent-flow/roles/planner.md`
-     - @implementer: `claude --dangerously-skip-permissions --model sonnet --append-system-prompt-file /path/to/agent-flow/roles/implementer.md`
-     - @codex: `codex -c model_instructions_file=/path/to/agent-flow/roles/reviewer.md`
+     - @claude (planner): `claude -w plan-{issue_id}-{run_id} --dangerously-skip-permissions --append-system-prompt-file /path/to/agent-flow/roles/planner.md`
+     - @implementer: `claude -w feature-{issue_id}-{run_id} --model sonnet --dangerously-skip-permissions --append-system-prompt-file /path/to/agent-flow/roles/implementer.md`
+     - @codex (reviewer): `codex -c model_instructions_file=/path/to/agent-flow/roles/reviewer.md` (operates in a manually-created worktree, see below)
   4. Wait briefly for CLI to initialize
   5. Send single-line instruction: `"Read and execute the task in {prompt_file_path}"`
+- `create_reviewer_worktree(issue_id, run_id, pr_branch)` — for @codex only, since Codex has no native `-w` flag:
+  1. `git worktree add /tmp/agent-flow/worktrees/review-{issue_id}-{run_id} {pr_branch}`
+  2. Returns the worktree path, which is used as the `repo_path` for `create_agent_window`
+- `cleanup_worktree(worktree_path)` — called after a run completes or fails:
+  1. `git worktree remove {worktree_path} --force`
+  2. Only for manually-created worktrees (reviewer). Claude Code's `-w` handles its own cleanup.
 - `capture_pane(window_name, lines=500)` — `tmux capture-pane -p -S -{lines}`
 - `kill_window(window_name)` — cleanup
 - `list_windows()` — for monitor
@@ -272,6 +280,12 @@ Functions:
 **Two-layer prompt architecture**:
 - **Layer 1 — Role (system prompt)**: Injected via CLI flag at spawn time. Contains agent identity, protocol rules, output contracts, handoff format, failure escalation rules. Lives in `roles/*.md`. Persistent for the entire session. Does NOT change between tasks. The target repo's own CLAUDE.md / AGENTS.md is loaded automatically by the CLI and coexists with our role file — no conflict.
 - **Layer 2 — Task (user prompt)**: Written to a temp file per invocation. Contains issue context, comment thread, specific instructions. Delivered via send-keys ("Read and execute the task in {path}"). Changes every time an agent is spawned.
+
+**Worktree isolation**:
+- **@claude (planner)**: Uses Claude Code's native `-w plan-{issue_id}-{run_id}` flag. Worktree created at `<repo>/.claude/worktrees/plan-{issue_id}-{run_id}/`. Auto-cleaned up by Claude Code on exit.
+- **@implementer**: Uses Claude Code's native `-w feature-{issue_id}-{run_id}` flag. Same auto-cleanup behavior. Branch is `worktree-feature-{issue_id}-{run_id}`.
+- **@codex (reviewer)**: Worktree created manually by spawn.py via `git worktree add` on the PR branch. Codex operates in this directory so it can read the actual files on the correct branch. Cleaned up by `spawn.cleanup_worktree()` after run completes.
+- The main repo checkout is never modified by agents. All work happens in worktrees.
 
 ### 6. roles/planner.md (static system prompt)
 
@@ -483,6 +497,8 @@ System: `tmux`, `gh` CLI, `claude` CLI, `codex` CLI, `ngrok` (dev)
 11. **Concurrency limit**: Create two issues simultaneously, verify only one @claude runs at a time, second is queued
 12. **Queue drain**: When active run completes, verify next queued run auto-promotes and spawns
 13. **Dependency blocking**: Create issue with `Depends-on: #X` where #X is open, verify it stays queued. Close #X, verify dependent issue promotes.
+14. **Worktree isolation**: Verify each agent operates in its own worktree, main repo checkout is untouched.
+15. **Worktree cleanup**: Verify reviewer worktrees are removed after run completes/fails.
 
 ## Risks
 
@@ -496,6 +512,8 @@ System: `tmux`, `gh` CLI, `claude` CLI, `codex` CLI, `ngrok` (dev)
 | tmux session disappears | Monitor checks session existence, recreates if needed |
 | Review cycle loops | Hard max of 3 cycles, then @human escalation (persisted in state.db) |
 | Recursive decomposition loops | Enforce `MAX_DECOMPOSITION_DEPTH` and idempotent `decomposition_done` flag per parent issue |
-| Concurrent agents on same repo | Max 1 active run per agent type; queue serializes work. Each issue gets its own branch. |
+| Concurrent agents on same repo | All agents work in isolated worktrees; main checkout never modified. Max 1 active run per agent type serializes work further. |
+| Merge conflicts between PRs | Queue serializes implementer runs, reducing conflicts. When they occur, `gh pr merge` fails → reviewer posts STATUS: BLOCKED → implementer rebases in fresh worktree. Counts as a review cycle. |
+| Codex worktree bugs | We create reviewer worktrees manually (`git worktree add`) and point Codex at them via `cd`, avoiding Codex's known worktree issues with session-based creation. |
 | Queue starvation from blocked deps | Monitor reports blocked issues in /status; dependencies only block specific issues, not the whole queue |
 | Restart loses track of active agents | state.db persists runs; monitor reconciles against tmux on startup |
