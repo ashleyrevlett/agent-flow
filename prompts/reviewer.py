@@ -7,7 +7,7 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 
-from config import PROMPT_DIR
+from config import PROMPT_DIR, TMP_DIR
 
 
 def build(
@@ -86,7 +86,7 @@ review_mode: plan
 Review the planner's plan above following the instructions in your system prompt (roles/reviewer.md).
 
 Key reminders:
-- Run `mkdir -p tmp` before writing any files to the tmp directory.
+- Run `mkdir -p {TMP_DIR}` before writing any files.
 - {comment_cmd}
 - Your comment must start with `<!-- agent:codex -->`
 - If approving: end with `STATUS: PLAN_APPROVED` and `@implementer please implement.`
@@ -154,7 +154,7 @@ review_mode: code
 Review the PR/MR above following the instructions in your system prompt (roles/reviewer.md).
 
 Key reminders:
-- Run `mkdir -p tmp` before writing any files to the tmp directory.
+- Run `mkdir -p {TMP_DIR}` before writing any files.
 - Run tests if available before deciding
 - Post your handoff on the **issue**:
   {comment_cmd}

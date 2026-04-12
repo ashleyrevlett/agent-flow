@@ -250,8 +250,9 @@ class GitHubProvider:
         return f"{base}/{repo}/issues/{issue_number}"
 
     # --- CLI templates for agent prompts ---
-    # Agents write comment/description bodies to tmp/ files then pass the file
-    # path to the CLI. This avoids shell quoting issues with multi-line markdown.
+    # Agents write comment/description bodies to files in TMP_DIR (absolute
+    # path inside the agent-flow project), then pass the file to the CLI.
+    # This avoids shell quoting issues and works regardless of the agent's cwd.
 
     def _gh_prefix(self) -> str:
         if not self._base_url:
@@ -260,17 +261,21 @@ class GitHubProvider:
         return f"GH_HOST={host} "
 
     def comment_cli(self, issue_number: int, repo: str) -> str:
+        from config import TMP_DIR
         p = self._gh_prefix()
+        f = f"{TMP_DIR}/comment-{issue_number}.md"
         return (
-            f"Write your comment body to tmp/comment.md, then run:\n"
-            f"`{p}gh issue comment {issue_number} --repo {repo} --body-file tmp/comment.md`"
+            f"Write your comment body to {f}, then run:\n"
+            f"`{p}gh issue comment {issue_number} --repo {repo} --body-file {f}`"
         )
 
-    def mr_create_cli(self, repo: str) -> str:
+    def mr_create_cli(self, issue_number: int, repo: str) -> str:
+        from config import TMP_DIR
         p = self._gh_prefix()
+        f = f"{TMP_DIR}/pr-body-{issue_number}.md"
         return (
-            f"Write your PR description to tmp/pr-body.md, then run:\n"
-            f"`{p}gh pr create --repo {repo} --body-file tmp/pr-body.md --title \"<title>\"`"
+            f"Write your PR description to {f}, then run:\n"
+            f"`{p}gh pr create --repo {repo} --body-file {f} --title \"<title>\"`"
         )
 
     def mr_merge_cli(self, mr_iid: int, repo: str) -> str:

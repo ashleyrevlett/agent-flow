@@ -6,7 +6,7 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 
-from config import PROMPT_DIR
+from config import PROMPT_DIR, TMP_DIR
 
 
 def build(
@@ -58,7 +58,7 @@ def build(
 """
 
     comment_cmd = provider.comment_cli(issue_number, repo)
-    mr_create_cmd = provider.mr_create_cli(repo)
+    mr_create_cmd = provider.mr_create_cli(issue_number, repo)
     link_syntax = provider.issue_link_syntax(issue_number)
 
     content = f"""# Implementer Task — Issue #{issue_number}
@@ -85,7 +85,7 @@ Issue: #{issue_number} — {issue_title}
 Implement the plan above following the instructions in your system prompt (roles/implementer.md).
 
 Key reminders:
-- Run `mkdir -p tmp` before writing any files to the tmp directory.
+- Run `mkdir -p {TMP_DIR}` before writing any files.
 - Branch: `issue-{issue_number}-<short-description>` from latest main
 - {mr_create_cmd}
   Include "{link_syntax}" in the body.

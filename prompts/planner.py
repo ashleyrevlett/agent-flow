@@ -6,7 +6,7 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 
-from config import PROMPT_DIR
+from config import PROMPT_DIR, TMP_DIR
 
 
 def build(
@@ -63,7 +63,7 @@ Issue: #{issue_number} — {issue_title}
 Analyze the issue above and produce a plan following the instructions in your system prompt (roles/planner.md).
 
 Key reminders:
-- Run `mkdir -p tmp` before writing any files to the tmp directory.
+- Run `mkdir -p {TMP_DIR}` before writing any files.
 - {comment_cmd}
 - Your comment must start with `<!-- agent:claude -->`
 - Use Mode A (direct plan with STATUS: PLAN_COMPLETE) or Mode B (decompose with STATUS: DECOMPOSED)

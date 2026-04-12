@@ -48,9 +48,10 @@ WORKTREE_DIR: str = os.getenv("WORKTREE_DIR", "/tmp/agent-flow/worktrees")
 # Deduplication TTL
 DEDUP_TTL_HOURS: int = int(os.getenv("DEDUP_TTL_HOURS", "24"))
 
-# Paths to role files (relative to this file)
+# Paths relative to this file (agent-flow project root)
 _HERE = Path(__file__).parent
 ROLES_DIR = _HERE / "roles"
+TMP_DIR = str(_HERE / "tmp")  # scratch dir for agent comment/PR body files
 
 # Agent definitions keyed by mention handle
 AGENTS = {
