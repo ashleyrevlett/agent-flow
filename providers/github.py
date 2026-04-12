@@ -250,15 +250,8 @@ class GitHubProvider:
         return f"{base}/{repo}/issues/{issue_number}"
 
     # --- CLI templates for agent prompts ---
-    # Agents write comment/description bodies to files in TMP_DIR (absolute
-    # path inside the agent-flow project), then pass the file to the CLI.
-    # This avoids shell quoting issues and works regardless of the agent's cwd.
-
-    def _gh_prefix(self) -> str:
-        if not self._base_url:
-            return ""
-        host = self._base_url.replace("https://", "").replace("http://", "").rstrip("/")
-        return f"GH_HOST={host} "
+    # Agents write bodies to files in TMP_DIR, then call wrapper scripts
+    # that handle gh/glab differences and avoid shell quoting issues.
 
     @staticmethod
     def _tmp_file(repo: str, issue_number: int, kind: str) -> str:
@@ -266,28 +259,39 @@ class GitHubProvider:
         repo_slug = repo.replace("/", "-")
         return f"{TMP_DIR}/{kind}-{repo_slug}-{issue_number}.md"
 
+    @staticmethod
+    def _script(name: str) -> str:
+        from pathlib import Path
+        return str(Path(__file__).parent.parent / "scripts" / name)
+
     def comment_cli(self, issue_number: int, repo: str) -> str:
-        p = self._gh_prefix()
         f = self._tmp_file(repo, issue_number, "comment")
+        script = self._script("post-comment")
         return (
             f"Write your comment body to {f}, then run:\n"
-            f"`{p}gh issue comment {issue_number} --repo {repo} --body-file {f}`"
+            f"`python3 {script} --repo {repo} --issue {issue_number} --file {f}`"
         )
 
     def mr_create_cli(self, issue_number: int, repo: str) -> str:
-        p = self._gh_prefix()
         f = self._tmp_file(repo, issue_number, "pr-body")
+        script = self._script("create-mr")
         return (
             f"Write your PR description to {f}, then run:\n"
-            f"`{p}gh pr create --repo {repo} --body-file {f} --title \"<title>\"`"
+            f"`python3 {script} --repo {repo} --title \"<title>\" --file {f}`"
         )
 
     def mr_merge_cli(self, mr_iid: int, repo: str) -> str:
-        p = self._gh_prefix()
+        p = ""
+        if self._base_url:
+            host = self._base_url.replace("https://", "").replace("http://", "").rstrip("/")
+            p = f"GH_HOST={host} "
         return f"{p}gh pr merge {mr_iid} --repo {repo} --squash --delete-branch"
 
     def mr_checks_cli(self, mr_iid: int, repo: str) -> str:
-        p = self._gh_prefix()
+        p = ""
+        if self._base_url:
+            host = self._base_url.replace("https://", "").replace("http://", "").rstrip("/")
+            p = f"GH_HOST={host} "
         return f"{p}gh pr checks {mr_iid} --repo {repo} --required --watch"
 
     def issue_link_syntax(self, issue_number: int) -> str:

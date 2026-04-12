@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+"""Post an issue comment from a file. Handles gh/glab CLI differences.
+
+Usage:
+    scripts/post-comment --repo owner/repo --issue 42 --file tmp/comment.md
+
+The file content is passed safely to the CLI without shell interpolation.
+"""
+
+import argparse
+import os
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from dotenv import load_dotenv
+load_dotenv()
+
+from config import GIT_PROVIDER, GIT_BASE_URL, API_TOKEN
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Post an issue comment from a file")
+    parser.add_argument("--repo", required=True)
+    parser.add_argument("--issue", required=True, type=int)
+    parser.add_argument("--file", required=True)
+    args = parser.parse_args()
+
+    with open(args.file) as f:
+        body = f.read()
+
+    if not body.strip():
+        print("Error: comment file is empty", file=sys.stderr)
+        sys.exit(1)
+
+    env = dict(os.environ)
+
+    if GIT_PROVIDER == "github":
+        if API_TOKEN and "GH_TOKEN" not in env and "GITHUB_TOKEN" not in env:
+            env["GH_TOKEN"] = API_TOKEN
+        if GIT_BASE_URL:
+            env["GH_HOST"] = GIT_BASE_URL.replace("https://", "").replace("http://", "").rstrip("/")
+
+        result = subprocess.run(
+            ["gh", "issue", "comment", str(args.issue),
+             "--repo", args.repo, "--body-file", args.file],
+            env=env, capture_output=True, text=True,
+        )
+
+    elif GIT_PROVIDER == "gitlab":
+        if API_TOKEN and "GITLAB_TOKEN" not in env:
+            env["GITLAB_TOKEN"] = API_TOKEN
+        if GIT_BASE_URL:
+            env["GITLAB_HOST"] = GIT_BASE_URL
+
+        # glab has no --body-file; use the API with --input to avoid shell quoting
+        import json
+        import urllib.parse
+        encoded_repo = urllib.parse.quote_plus(args.repo)
+        payload = json.dumps({"body": body})
+
+        result = subprocess.run(
+            ["glab", "api", "--method", "POST",
+             f"projects/{encoded_repo}/issues/{args.issue}/notes",
+             "--input", "-"],
+            input=payload, env=env, capture_output=True, text=True,
+        )
+
+    else:
+        print(f"Unknown GIT_PROVIDER: {GIT_PROVIDER}", file=sys.stderr)
+        sys.exit(1)
+
+    if result.returncode != 0:
+        print(f"Error: {result.stderr}", file=sys.stderr)
+        sys.exit(1)
+
+    print("Comment posted.")
+
+
+if __name__ == "__main__":
+    main()

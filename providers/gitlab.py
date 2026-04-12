@@ -378,9 +378,8 @@ class GitLabProvider:
         return f"{base}/{repo}/-/issues/{issue_number}"
 
     # --- CLI templates for agent prompts ---
-    # Agents write comment/description bodies to files in TMP_DIR (absolute
-    # path inside the agent-flow project), then pass the file to the CLI.
-    # This avoids shell quoting issues and works regardless of the agent's cwd.
+    # Agents write bodies to files in TMP_DIR, then call wrapper scripts
+    # that handle gh/glab differences and avoid shell quoting issues.
 
     @staticmethod
     def _tmp_file(repo: str, issue_number: int, kind: str) -> str:
@@ -388,20 +387,25 @@ class GitLabProvider:
         repo_slug = repo.replace("/", "-")
         return f"{TMP_DIR}/{kind}-{repo_slug}-{issue_number}.md"
 
+    @staticmethod
+    def _script(name: str) -> str:
+        from pathlib import Path
+        return str(Path(__file__).parent.parent / "scripts" / name)
+
     def comment_cli(self, issue_number: int, repo: str) -> str:
-        p = self._host_prefix()
         f = self._tmp_file(repo, issue_number, "comment")
+        script = self._script("post-comment")
         return (
             f"Write your comment body to {f}, then run:\n"
-            f"`{p}glab issue note {issue_number} --repo {repo} -m \"$(cat {f})\"`"
+            f"`python3 {script} --repo {repo} --issue {issue_number} --file {f}`"
         )
 
     def mr_create_cli(self, issue_number: int, repo: str) -> str:
-        p = self._host_prefix()
         f = self._tmp_file(repo, issue_number, "mr-body")
+        script = self._script("create-mr")
         return (
             f"Write your MR description to {f}, then run:\n"
-            f"`{p}glab mr create --repo {repo} --description \"$(cat {f})\" --title \"<title>\"`"
+            f"`python3 {script} --repo {repo} --title \"<title>\" --file {f}`"
         )
 
     def mr_merge_cli(self, mr_iid: int, repo: str) -> str:

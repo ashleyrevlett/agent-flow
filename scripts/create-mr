@@ -1,0 +1,73 @@
+#!/usr/bin/env python3
+"""Create a PR/MR with description from a file. Handles gh/glab CLI differences.
+
+Usage:
+    scripts/create-mr --repo owner/repo --title "Fix bug" --file tmp/pr-body.md
+
+Runs from inside the repo working directory (the agent's cwd).
+The file content is passed safely without shell interpolation.
+"""
+
+import argparse
+import os
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from dotenv import load_dotenv
+load_dotenv()
+
+from config import GIT_PROVIDER, GIT_BASE_URL, API_TOKEN
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Create a PR/MR with description from a file")
+    parser.add_argument("--repo", required=True)
+    parser.add_argument("--title", required=True)
+    parser.add_argument("--file", required=True)
+    args = parser.parse_args()
+
+    with open(args.file) as f:
+        body = f.read()
+
+    env = dict(os.environ)
+
+    if GIT_PROVIDER == "github":
+        if API_TOKEN and "GH_TOKEN" not in env and "GITHUB_TOKEN" not in env:
+            env["GH_TOKEN"] = API_TOKEN
+        if GIT_BASE_URL:
+            env["GH_HOST"] = GIT_BASE_URL.replace("https://", "").replace("http://", "").rstrip("/")
+
+        result = subprocess.run(
+            ["gh", "pr", "create", "--repo", args.repo,
+             "--title", args.title, "--body-file", args.file],
+            env=env, capture_output=True, text=True,
+        )
+
+    elif GIT_PROVIDER == "gitlab":
+        if API_TOKEN and "GITLAB_TOKEN" not in env:
+            env["GITLAB_TOKEN"] = API_TOKEN
+        if GIT_BASE_URL:
+            env["GITLAB_HOST"] = GIT_BASE_URL
+
+        result = subprocess.run(
+            ["glab", "mr", "create", "--repo", args.repo,
+             "--title", args.title, "--description", body,
+             "--fill", "--push"],
+            env=env, capture_output=True, text=True,
+        )
+
+    else:
+        print(f"Unknown GIT_PROVIDER: {GIT_PROVIDER}", file=sys.stderr)
+        sys.exit(1)
+
+    if result.returncode != 0:
+        print(f"Error: {result.stderr}", file=sys.stderr)
+        sys.exit(1)
+
+    print(result.stdout.strip())
+
+
+if __name__ == "__main__":
+    main()
