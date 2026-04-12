@@ -118,15 +118,24 @@ def _send_keys(window: str, keys: str, enter: bool = True):
     _tmux(cmd)
 
 
-def _handle_trust_prompt(window_name: str, timeout: int = 15, poll_interval: float = 1.0):
-    """Wait for Claude Code to initialize. If it shows a trust prompt, send 'y'.
+def _handle_trust_prompt(window_name: str, agent_name: str, timeout: int = 15, poll_interval: float = 1.0):
+    """Wait for a CLI to initialize. Dismiss trust prompts automatically.
 
-    Claude Code with --dangerously-skip-permissions asks the user to confirm
-    trusting the directory on first use. This polls the pane content and
-    sends 'y' when detected, then waits for the CLI to be ready for input.
+    Claude Code: asks "Do you want to trust...?" — expects 'y' + Enter.
+    Codex CLI:   shows numbered menu ("1. Yes, continue") with option 1
+                 pre-selected — expects Enter to confirm.
+
+    Polls the pane and sends the appropriate key when a trust prompt is
+    detected, then waits for the CLI to be ready for input.
     """
     import re
-    trust_pattern = re.compile(r"trust|Do you want to|y/n|Yes.*No", re.IGNORECASE)
+    # Matches both Claude Code and Codex trust prompts
+    trust_pattern = re.compile(
+        r"Do you trust|trust the contents|y/n|Yes.*continue|Yes.*No",
+        re.IGNORECASE,
+    )
+    # Codex shows a numbered menu with "Press enter to continue"
+    codex_menu_pattern = re.compile(r"Press enter to continue|Yes,\s*continue", re.IGNORECASE)
     elapsed = 0.0
 
     while elapsed < timeout:
@@ -135,13 +144,19 @@ def _handle_trust_prompt(window_name: str, timeout: int = 15, poll_interval: flo
         content = capture_pane(window_name, lines=30)
 
         if trust_pattern.search(content):
-            logger.info("Trust prompt detected in %s — sending 'y'", window_name)
-            _send_keys(window_name, "y")
+            if codex_menu_pattern.search(content):
+                # Codex: option 1 (Yes) is pre-selected, just press Enter
+                logger.info("Codex trust prompt detected in %s — sending Enter", window_name)
+                _send_keys(window_name, "", enter=True)
+            else:
+                # Claude Code: send 'y' to confirm
+                logger.info("Claude trust prompt detected in %s — sending 'y'", window_name)
+                _send_keys(window_name, "y")
             # Wait for CLI to finish initializing after trust confirmation
             time.sleep(3)
             return
 
-        # If we see the input prompt (> or $) without a trust prompt, CLI is ready
+        # If the CLI input prompt appears without a trust prompt, it's ready
         lines = [l.strip() for l in content.splitlines() if l.strip()]
         if lines and (lines[-1].startswith(">") or lines[-1].endswith("$")):
             return
@@ -174,13 +189,10 @@ def create_agent_window(
     cli_cmd = _build_cli_command(agent_name, issue_id, run_id)
     _send_keys(window_name, cli_cmd)
 
-    # Claude Code with --dangerously-skip-permissions prompts the user to
-    # trust the directory on first launch. Poll the pane and send 'y' if
-    # the trust prompt appears, then wait for the CLI to fully initialize.
-    if agent_name in ("claude", "implementer"):
-        _handle_trust_prompt(window_name)
-    else:
-        time.sleep(2)
+    # Both Claude Code and Codex CLI may prompt the user to trust the
+    # working directory on first launch. Poll the pane and dismiss the
+    # prompt before sending the task instruction.
+    _handle_trust_prompt(window_name, agent_name=agent_name)
 
     # Send single-line task instruction
     instruction = f"Read and execute the task in {prompt_file_path}"
