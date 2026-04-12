@@ -305,7 +305,7 @@ Placed in the repo agents work on. Instructs Claude Code on the pipeline protoco
 - **All handoff comments must be issue comments** (`gh issue comment`), never PR comments. The webhook routing depends on this.
 - PR reviews go through `gh pr review` (approve/request-changes), but the handoff @mention is always a separate issue comment.
 - Always tag comments with `<!-- agent:ROLE -->`
-- Always end with exactly one @mention handoff on the last line
+- Always end with exactly one @mention handoff on the last line, **except** when posting `STATUS: APPROVED` — approval means the pipeline is complete, no further agent is needed
 - Always include a `STATUS:` line before the handoff (PLAN_COMPLETE, IMPLEMENTATION_COMPLETE, APPROVED, CHANGES_REQUESTED, BLOCKED, FAILED)
 - Never silently exit — always post a status comment even on failure
 - Branch naming: `feature/{issue_number}-{short_desc}`
