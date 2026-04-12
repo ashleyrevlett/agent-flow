@@ -85,9 +85,12 @@ Issue: #{issue_number} — {issue_title}
 Implement the plan above following the instructions in your system prompt (roles/implementer.md).
 
 Key reminders:
+- Run `mkdir -p tmp` before writing any files to the tmp directory.
 - Branch: `issue-{issue_number}-<short-description>` from latest main
-- Open a PR/MR with `{mr_create_cmd}` with "{link_syntax}" in the body
-- Post your handoff on the **issue** (not the PR/MR): `{comment_cmd}`
+- {mr_create_cmd}
+  Include "{link_syntax}" in the body.
+- Post your handoff on the **issue** (not the PR/MR):
+  {comment_cmd}
 - Your comment must start with `<!-- agent:implementer -->`
 - End with `STATUS: IMPLEMENTATION_COMPLETE` and `@codex please review PR #N.`
 - Never silently exit — always post an issue comment with a STATUS line

@@ -378,19 +378,29 @@ class GitLabProvider:
         return f"{base}/{repo}/-/issues/{issue_number}"
 
     # --- CLI templates for agent prompts ---
+    # Agents write comment/description bodies to tmp/ files then pass the file
+    # path to the CLI. This avoids shell quoting issues with multi-line markdown.
 
     def comment_cli(self, issue_number: int, repo: str) -> str:
-        return f'{self._host_prefix()}glab issue note {issue_number} --repo {repo} -m "..."'
+        p = self._host_prefix()
+        return (
+            f"Write your comment body to tmp/comment.md, then run:\n"
+            f"`{p}glab issue note {issue_number} --repo {repo} -m \"$(cat tmp/comment.md)\"`"
+        )
 
     def mr_create_cli(self, repo: str) -> str:
-        return f"{self._host_prefix()}glab mr create --repo {repo} ..."
+        p = self._host_prefix()
+        return (
+            f"Write your MR description to tmp/mr-body.md, then run:\n"
+            f"`{p}glab mr create --repo {repo} --description \"$(cat tmp/mr-body.md)\" --title \"<title>\"`"
+        )
 
     def mr_merge_cli(self, mr_iid: int, repo: str) -> str:
         return f"{self._host_prefix()}glab mr merge {mr_iid} --repo {repo} --squash"
 
     def mr_checks_cli(self, mr_iid: int, repo: str) -> str:
-        # GitLab uses pipeline status; --branch targets the MR source branch
-        return f"{self._host_prefix()}glab ci status --repo {repo} --branch $(glab mr view {mr_iid} --repo {repo} -F json | jq -r '.source_branch')"
+        p = self._host_prefix()
+        return f"{p}glab ci status --repo {repo} --branch $(glab mr view {mr_iid} --repo {repo} -F json | jq -r '.source_branch')"
 
     def issue_link_syntax(self, issue_number: int) -> str:
         return f"Closes #{issue_number}"

@@ -63,7 +63,8 @@ Issue: #{issue_number} — {issue_title}
 Analyze the issue above and produce a plan following the instructions in your system prompt (roles/planner.md).
 
 Key reminders:
-- Post your output as an issue comment via: `{comment_cmd}`
+- Run `mkdir -p tmp` before writing any files to the tmp directory.
+- {comment_cmd}
 - Your comment must start with `<!-- agent:claude -->`
 - Use Mode A (direct plan with STATUS: PLAN_COMPLETE) or Mode B (decompose with STATUS: DECOMPOSED)
 - In Mode A: end with `@codex please review this plan.`

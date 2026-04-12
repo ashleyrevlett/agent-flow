@@ -86,7 +86,8 @@ review_mode: plan
 Review the planner's plan above following the instructions in your system prompt (roles/reviewer.md).
 
 Key reminders:
-- Post your review as an issue comment: `{comment_cmd}`
+- Run `mkdir -p tmp` before writing any files to the tmp directory.
+- {comment_cmd}
 - Your comment must start with `<!-- agent:codex -->`
 - If approving: end with `STATUS: PLAN_APPROVED` and `@implementer please implement.`
 - If requesting changes: end with `STATUS: PLAN_CHANGES_REQUESTED` and `@claude please revise the plan.`
@@ -153,8 +154,10 @@ review_mode: code
 Review the PR/MR above following the instructions in your system prompt (roles/reviewer.md).
 
 Key reminders:
+- Run `mkdir -p tmp` before writing any files to the tmp directory.
 - Run tests if available before deciding
-- Post your handoff on the **issue**: `{comment_cmd}`
+- Post your handoff on the **issue**:
+  {comment_cmd}
 - Your comment must start with `<!-- agent:codex -->`
 - If approving:
   1. `{mr_checks_cmd}`

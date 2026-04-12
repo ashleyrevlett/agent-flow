@@ -250,22 +250,36 @@ class GitHubProvider:
         return f"{base}/{repo}/issues/{issue_number}"
 
     # --- CLI templates for agent prompts ---
+    # Agents write comment/description bodies to tmp/ files then pass the file
+    # path to the CLI. This avoids shell quoting issues with multi-line markdown.
+
+    def _gh_prefix(self) -> str:
+        if not self._base_url:
+            return ""
+        host = self._base_url.replace("https://", "").replace("http://", "").rstrip("/")
+        return f"GH_HOST={host} "
 
     def comment_cli(self, issue_number: int, repo: str) -> str:
-        prefix = f"GH_HOST={self._base_url.replace('https://', '').replace('http://', '').rstrip('/')} " if self._base_url else ""
-        return f'{prefix}gh issue comment {issue_number} --repo {repo} --body "..."'
+        p = self._gh_prefix()
+        return (
+            f"Write your comment body to tmp/comment.md, then run:\n"
+            f"`{p}gh issue comment {issue_number} --repo {repo} --body-file tmp/comment.md`"
+        )
 
     def mr_create_cli(self, repo: str) -> str:
-        prefix = f"GH_HOST={self._base_url.replace('https://', '').replace('http://', '').rstrip('/')} " if self._base_url else ""
-        return f'{prefix}gh pr create --repo {repo} ...'
+        p = self._gh_prefix()
+        return (
+            f"Write your PR description to tmp/pr-body.md, then run:\n"
+            f"`{p}gh pr create --repo {repo} --body-file tmp/pr-body.md --title \"<title>\"`"
+        )
 
     def mr_merge_cli(self, mr_iid: int, repo: str) -> str:
-        prefix = f"GH_HOST={self._base_url.replace('https://', '').replace('http://', '').rstrip('/')} " if self._base_url else ""
-        return f"{prefix}gh pr merge {mr_iid} --repo {repo} --squash --delete-branch"
+        p = self._gh_prefix()
+        return f"{p}gh pr merge {mr_iid} --repo {repo} --squash --delete-branch"
 
     def mr_checks_cli(self, mr_iid: int, repo: str) -> str:
-        prefix = f"GH_HOST={self._base_url.replace('https://', '').replace('http://', '').rstrip('/')} " if self._base_url else ""
-        return f"{prefix}gh pr checks {mr_iid} --repo {repo} --required --watch"
+        p = self._gh_prefix()
+        return f"{p}gh pr checks {mr_iid} --repo {repo} --required --watch"
 
     def issue_link_syntax(self, issue_number: int) -> str:
         return f"Closes #{issue_number}"

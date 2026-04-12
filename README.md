@@ -97,6 +97,26 @@ Both must appear in the same comment. The `STATUS:` line can go anywhere; the `@
 - **HTTP**: `GET /status` returns the same info as JSON
 - **tmux**: `tmux attach -t agent-flow` to watch agent sessions live
 
+## Scripts
+
+### `scripts/status`
+
+Print a digest of the current pipeline state: agent activity, active issues, tmux windows, and recent runs.
+
+```sh
+python scripts/status
+```
+
+### `scripts/reset-breaker`
+
+Clear circuit breaker(s) when an agent is rate-limited or stuck in a tripped state.
+
+```sh
+python scripts/reset-breaker claude      # reset one agent
+python scripts/reset-breaker codex       # reset another
+python scripts/reset-breaker --all       # reset all agents
+```
+
 ## Docs
 
 - Developer spec and architecture: `SPEC.md`
