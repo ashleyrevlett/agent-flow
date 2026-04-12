@@ -18,6 +18,9 @@ GIT_REPO: str = os.environ.get("GIT_REPO", os.environ.get("GITHUB_REPO", ""))
 BOT_USERNAME: str = os.environ.get("BOT_USERNAME", os.environ.get("BOT_GITHUB_USERNAME", ""))
 GIT_BASE_URL: str = os.getenv("GIT_BASE_URL", "")  # e.g. "https://gitlab.company.com"
 
+# Allow bot to respond to its own opened issues (for testing with single user)
+ALLOW_SELF_TRIGGER: bool = os.getenv("ALLOW_SELF_TRIGGER", "false").lower() == "true"
+
 # Backward-compat aliases (existing .env files keep working)
 GITHUB_WEBHOOK_SECRET: str = WEBHOOK_SECRET
 GITHUB_TOKEN: str = API_TOKEN

@@ -13,6 +13,7 @@ from config import (
     MAX_REVIEW_CYCLES,
     MAX_DECOMPOSITION_DEPTH,
 )
+from config import ALLOW_SELF_TRIGGER
 from provider import WebhookEvent, get_provider
 from prompts import planner as planner_prompt
 from prompts import implementer as implementer_prompt
@@ -65,7 +66,7 @@ def _route(event: WebhookEvent):
         issue_body = event.issue_body
 
         # Self-triggered filter
-        if event.is_bot:
+        if event.is_bot and not ALLOW_SELF_TRIGGER:
             logger.info("Ignoring self-opened issue #%s", issue_number)
             return
 
