@@ -255,15 +255,34 @@ Same structure but:
 - **All handoff @mentions must be posted as issue comments via `gh issue comment`, never as PR comments.** This is critical for the webhook routing to work.
 - Comment tag: `<!-- agent:codex -->`
 
-**Output contract** — reviewer issue comment must follow this structure:
+**Output contract** — reviewer issue comment must follow one of these templates:
+
+Approved (no @mention — pipeline ends):
 ```
 <!-- agent:codex -->
 ## Review of PR #{pr_number}
-[review summary — what's good, what needs changes]
+[review summary — what's good]
 ---
-STATUS: APPROVED | CHANGES_REQUESTED | BLOCKED
+STATUS: APPROVED
+```
+
+Changes requested:
+```
+<!-- agent:codex -->
+## Review of PR #{pr_number}
+[review summary — what needs fixing]
+---
+STATUS: CHANGES_REQUESTED
 @implementer please address the feedback above.
-  OR
+```
+
+Blocked:
+```
+<!-- agent:codex -->
+## Review of PR #{pr_number}
+[what's blocking]
+---
+STATUS: BLOCKED
 @human please review — [reason].
 ```
 
