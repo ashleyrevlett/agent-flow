@@ -217,8 +217,8 @@ Functions:
 - `enqueue_run(issue_number, repo, agent, prompt_file)` — insert new run with status `queued`, returns `run_id`. Called before any spawn attempt.
 - `try_promote(agent)` — atomically: if no `active` run exists for this agent type, find the oldest `queued` run **whose issue has no unsatisfied dependencies** (`is_blocked() == False`), promote it to `active`, and return it. If an `active` run exists or all queued runs are blocked, return `None`. Uses `UPDATE ... WHERE` with subqueries to prevent races.
 - `update_run_window(run_id, tmux_window)` — set window name after successful spawn
-- `complete_run(run_id)` — mark `completed`, set `completed_at`, call `spawn.cleanup_worktree()` if `worktree_path` is set, then call `try_promote(agent)` to auto-dequeue the next job
-- `fail_run(run_id, status)` — mark `failed` or `stuck`, call `spawn.cleanup_worktree()` if `worktree_path` is set, then call `try_promote(agent)` to auto-dequeue
+- `complete_run(run_id)` — **idempotent**: no-op if status is not `active`. Otherwise mark `completed`, set `completed_at`, call `spawn.cleanup_worktree()` if `worktree_path` is set, then call `try_promote(agent)` to auto-dequeue the next job. Safe to call multiple times (monitor may detect completion via both pane exit and GitHub comment).
+- `fail_run(run_id, status)` — **idempotent**: no-op if status is not `active`. Otherwise mark `failed` or `stuck`, call `spawn.cleanup_worktree()` if `worktree_path` is set, then call `try_promote(agent)` to auto-dequeue
 - `get_active_runs()` — all runs with status `active`, for monitor to reconnect after restart
 - `get_queue_depth(agent=None)` — count of `queued` runs, optionally filtered by agent type (for /status command)
 - `is_duplicate(delivery_id)` — atomic `INSERT ... ON CONFLICT DO NOTHING`, returns `True` if 0 rows affected (already seen). No separate check step — single statement eliminates race window under concurrent webhook handling.
@@ -328,7 +328,7 @@ Functions:
 - `create_reviewer_worktree(issue_id, run_id, pr_branch)` — for @codex **code review** only, since Codex has no native `-w` flag:
   1. `git worktree add /tmp/agent-flow/worktrees/review-{issue_id}-{run_id} {pr_branch}`
   2. Returns the worktree path, which is used as the `repo_path` for `create_agent_window`
-  3. **Not called for plan reviews** — plan review uses the main repo path since no PR branch exists
+  3. For **plan reviews**: called with `pr_branch=None`, creates a detached-HEAD worktree on the default branch: `git worktree add /tmp/agent-flow/worktrees/planreview-{issue_id}-{run_id} HEAD --detach`
 - `cleanup_worktree(worktree_path)` — called after a run completes or fails:
   1. `git worktree remove {worktree_path} --force`
   2. Only for manually-created worktrees (reviewer). Claude Code's `-w` handles its own cleanup.
