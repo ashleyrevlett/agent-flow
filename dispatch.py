@@ -241,7 +241,7 @@ def _handle_comment(
             logger.warning("Stage transition failed for issue #%s (%s→%s)", issue_number, expected_stage, new_stage)
         return
 
-    # Review cycle limit check
+    # Review cycle limit check (count read before transition; increment after)
     if review_type:
         count = state.get_review_count(issue_number, repo, review_type)
         if count >= MAX_REVIEW_CYCLES:
@@ -255,7 +255,6 @@ def _handle_comment(
                 issue_url=f"https://github.com/{repo}/issues/{issue_number}",
             )
             return
-        state.increment_review_count(issue_number, repo, review_type)
 
     # Atomic stage transition
     if not state.transition(issue_number, repo, expected_stage, new_stage):
@@ -264,6 +263,11 @@ def _handle_comment(
             issue_number, expected_stage, new_stage,
         )
         return
+
+    # Increment only after a successful transition so stale/duplicate comments
+    # don't consume the cycle budget.
+    if review_type:
+        state.increment_review_count(issue_number, repo, review_type)
 
     if agent:
         _dispatch_agent(
@@ -499,22 +503,47 @@ def _fetch_pr_branch(repo: str, pr_number: int) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 def _parse_mention(body: str) -> Optional[str]:
-    """Extract @mention from last non-empty line of body.
+    """Extract @mention from last non-empty, non-code, non-blockquote line.
 
-    Only parses if the body contains <!-- agent:NAME --> tag (agent comment)
-    or the caller already verified author_association (handled in _route).
-    Ignores mentions inside code blocks or blockquotes.
+    Ignores:
+    - Lines inside fenced code blocks (``` or ~~~)
+    - Lines that start with > (blockquotes)
+    - @mentions inside inline backtick spans on the last line
     """
     lines = body.splitlines()
-    # Find last non-empty line
-    for line in reversed(lines):
+
+    # Track which lines are inside fenced code blocks (forward pass).
+    in_fence = False
+    fence_marker: str = ""
+    fenced: list[bool] = []
+    for line in lines:
+        stripped = line.strip()
+        if not in_fence:
+            if stripped.startswith("```") or stripped.startswith("~~~"):
+                in_fence = True
+                fence_marker = stripped[:3]
+                fenced.append(True)
+            else:
+                fenced.append(False)
+        else:
+            fenced.append(True)
+            if stripped.startswith(fence_marker):
+                in_fence = False
+
+    # Find last non-empty, non-fenced, non-blockquote line.
+    for idx in range(len(lines) - 1, -1, -1):
+        line = lines[idx]
         stripped = line.strip()
         if not stripped:
             continue
-        # Skip blockquotes
+        if fenced[idx]:
+            return None
         if stripped.startswith(">"):
             return None
-        match = _MENTION_RE.search(stripped)
+        # Strip inline backtick spans before searching for a mention so that
+        # `@some-handle` in code does not route.
+        sanitised = re.sub(r"`[^`]*`", "", stripped)
+        match = _MENTION_RE.search(sanitised)
         if match:
             return match.group(1)
         return None

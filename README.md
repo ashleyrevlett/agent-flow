@@ -8,12 +8,13 @@ No orchestrator LLM. No API billing. Pure pattern matching + subscription-plan C
 
 1. A GitHub issue is created
 2. The webhook dispatcher spawns **@claude** (planner) in a tmux window
-3. @claude posts a plan as an issue comment, ending with `@implementer please implement`
-4. The dispatcher catches the @mention and spawns **@implementer**
-5. @implementer writes code, opens a PR, ending with `@codex please review`
-6. **@codex** reviews — approves or requests changes (up to 3 cycles)
-7. PR merges → CI runs → issue auto-closes
-8. Hindsight extracts lessons from the closed issue into memory
+3. @claude posts a plan comment ending with `STATUS: PLAN_COMPLETE` and `@codex please review`
+4. **@codex** reviews the plan — approves (`STATUS: PLAN_APPROVED @implementer`) or requests changes
+5. @implementer writes code, opens a PR, and posts `STATUS: IMPLEMENTATION_COMPLETE @codex`
+6. **@codex** reviews the code — approves and merges, or requests changes (up to 3 cycles per review phase)
+7. PR merges → issue auto-closes
+
+Large issues can be decomposed: @claude posts `STATUS: DECOMPOSED` and creates child issues that run the pipeline independently.
 
 Humans can intervene at any point via `@human` mentions (triggers Telegram notification).
 
@@ -30,10 +31,13 @@ All use subscription-plan billing, not API keys.
 ## Architecture
 
 ```
-GitHub Webhook → FastAPI → dispatch.py → tmux agent sessions
-                                       → monitor.py (health checks)
-                                       → hindsight.py (lesson extraction)
-                                       → telegram.py (human escalation)
+GitHub Webhook → FastAPI (webhook.py)
+                    │
+                    ├── dispatch.py   — comment routing, stage machine calls
+                    ├── state.py      — SQLite stage/run/circuit-breaker state
+                    ├── spawn.py      — tmux window + git worktree management
+                    ├── monitor.py    — async health-check + completion polling
+                    └── notifications.py — Telegram alerts + /status bot
 ```
 
 GitHub comments are the message bus. Agents self-direct handoffs via @mentions.

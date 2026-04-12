@@ -22,7 +22,7 @@ _VALID_TRANSITIONS: dict[str, set[str]] = {
     "open":         {"planning"},
     "planning":     {"plan_review", "decomposed"},
     "plan_review":  {"implementing", "planning"},
-    "implementing": {"code_review"},
+    "implementing": {"code_review", "planning"},  # planning: BLOCKED re-route to planner
     "code_review":  {"approved", "implementing"},
 }
 

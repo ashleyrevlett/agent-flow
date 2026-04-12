@@ -82,6 +82,15 @@ class TestStageMachine:
             assert state.transition(issue, REPO, expected, new) is True
         assert state.get_stage(issue, REPO) == "approved"
 
+    def test_blocked_reraise_to_planning(self):
+        """implementing → planning is valid (BLOCKED re-route to planner)."""
+        state.get_stage(5, REPO)
+        state.transition(5, REPO, "open", "planning")
+        state.transition(5, REPO, "planning", "plan_review")
+        state.transition(5, REPO, "plan_review", "implementing")
+        assert state.transition(5, REPO, "implementing", "planning") is True
+        assert state.get_stage(5, REPO) == "planning"
+
     def test_review_count(self):
         state.get_stage(1, REPO)
         assert state.get_review_count(1, REPO, "plan") == 0

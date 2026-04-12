@@ -48,6 +48,18 @@ class TestParseMention:
         body = "@codex please review\n\n  "
         assert dispatch._parse_mention(body) == "codex"
 
+    def test_fenced_code_block_last_line_returns_none(self):
+        body = "Plan:\n```\n@codex please review\n```"
+        assert dispatch._parse_mention(body) is None
+
+    def test_mention_after_fenced_block(self):
+        body = "```\nsome code\n```\n@implementer please implement"
+        assert dispatch._parse_mention(body) == "implementer"
+
+    def test_inline_backtick_span_ignored(self):
+        body = "Run `@codex` to lint"
+        assert dispatch._parse_mention(body) is None
+
 
 # ---------------------------------------------------------------------------
 # _parse_status

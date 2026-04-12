@@ -9,6 +9,7 @@ import json
 import logging
 import re
 import subprocess
+from datetime import datetime, timezone
 from typing import Optional
 
 import state
@@ -54,6 +55,14 @@ async def monitor_loop():
         await asyncio.sleep(MONITOR_POLL_SECONDS)
 
 
+def _cleanup_run_worktree(run) -> None:
+    """Remove a reviewer worktree when the run ends (any terminal status)."""
+    worktree_path = run["worktree_path"] if hasattr(run, "__getitem__") else None
+    if worktree_path and run["agent"] == "codex":
+        from config import REPO_LOCAL_PATH
+        spawn.cleanup_worktree(worktree_path, repo_path=REPO_LOCAL_PATH)
+
+
 async def _startup_recovery():
     """On startup: reconcile DB state with actual tmux windows."""
     active_runs = state.get_active_runs()
@@ -65,6 +74,7 @@ async def _startup_recovery():
         if window and window not in live_windows:
             logger.warning("Orphaned run %d (window %s gone) — marking failed", run_id, window)
             state.fail_run(run_id)
+            _cleanup_run_worktree(run)
         else:
             # Re-register in our tracking dicts
             import time
@@ -110,6 +120,7 @@ async def _poll():
                 run_id, agent, issue_number, idle_seconds,
             )
             state.fail_run(run_id, new_status="stuck")
+            _cleanup_run_worktree(run)
             telegram.send_stuck_alert(
                 agent=agent,
                 window=window,
@@ -131,6 +142,7 @@ async def _poll():
                 excerpt = _extract_error(pane_content)
                 logger.error("Error detected in run %d (%s): %s", run_id, agent, excerpt[:200])
                 state.fail_run(run_id, new_status="failed")
+                _cleanup_run_worktree(run)
                 telegram.send_stuck_alert(
                     agent=agent,
                     window=window,
@@ -154,11 +166,15 @@ async def _poll():
         )
         if completed:
             logger.info("Run %d completion detected via GitHub comment (STATUS: %s)", run_id, status_token)
-            _handle_completion(run_id, agent, issue_number, repo, status_token, run["worktree_path"])
+            _handle_completion(run, status_token)
 
 
-def _handle_completion(run_id: int, agent: str, issue_number: int, repo: str, status_token: Optional[str], worktree_path: Optional[str] = None):
+def _handle_completion(run, status_token: Optional[str]):
     """Handle a completion event detected via GitHub comment polling."""
+    run_id = run["id"]
+    agent = run["agent"]
+    issue_number = run["issue_number"]
+    repo = run["repo"]
 
     # APPROVED — monitor handles this (no @mention so dispatch never sees it)
     if status_token == "APPROVED" and agent == "codex":
@@ -176,10 +192,22 @@ def _handle_completion(run_id: int, agent: str, issue_number: int, repo: str, st
         # All other terminal statuses — mark complete and let dispatch handle routing
         state.complete_run(run_id)
 
-    # Clean up reviewer worktree
-    if worktree_path and agent == "codex":
-        from config import REPO_LOCAL_PATH
-        spawn.cleanup_worktree(worktree_path, repo_path=REPO_LOCAL_PATH)
+    _cleanup_run_worktree(run)
+
+
+def _sqlite_ts_to_iso(ts: str) -> str:
+    """Convert SQLite CURRENT_TIMESTAMP ("YYYY-MM-DD HH:MM:SS") to ISO 8601 UTC.
+
+    GitHub comment timestamps are "YYYY-MM-DDTHH:MM:SSZ". JQ string ordering
+    only works correctly when both sides share the same format, so we normalise
+    the SQLite value before embedding it in the JQ expression.
+    """
+    try:
+        dt = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        # Already ISO or unrecognised — return as-is and let JQ decide.
+        return ts
 
 
 async def _check_github_completion(
@@ -192,12 +220,13 @@ async def _check_github_completion(
     Guards against stale comments from prior runs on the same issue
     prematurely completing a new run.
     """
+    iso_started_at = _sqlite_ts_to_iso(run_started_at)
     try:
         result = subprocess.run(
             ["gh", "api", f"repos/{repo}/issues/{issue_number}/comments",
              "--jq",
              f'[.[] | select(.body | contains("<!-- agent:{agent} -->"))'
-             f' | select(.created_at > "{run_started_at}")] | last'],
+             f' | select(.created_at > "{iso_started_at}")] | last'],
             capture_output=True, text=True, check=True,
         )
         raw = result.stdout.strip()
