@@ -39,7 +39,7 @@ GitHub Webhook (issues, comments, PRs, CI)
 |---|---|---|
 | `issues.opened` | New issue created | → @claude (planner) |
 | `issue_comment.created` | Comment with @mention | → mentioned agent |
-| `pull_request.opened` | PR opened | → @codex (reviewer) |
+| `pull_request.opened` | PR opened | → ignore (handoff comes via @mention in comment) |
 | `pull_request_review_comment.created` | PR comment with @mention | → mentioned agent |
 | `workflow_run.completed` | CI finished | → log result |
 
@@ -50,8 +50,9 @@ Human creates issue (or via Telegram → gh issue create)
   → webhook: issues.opened → dispatch @claude
   → @claude posts plan as issue comment, ends with "@implementer please implement"
   → webhook: issue_comment → dispatch @implementer
-  → @implementer creates branch, writes code, opens PR, ends with "@codex please review"
-  → webhook: pull_request.opened → dispatch @codex
+  → @implementer creates branch, writes code, opens PR
+  → @implementer posts issue comment ending with "@codex please review PR #N"
+  → webhook: issue_comment → dispatch @codex
   → @codex reviews PR
       → approve: "@claude implementation approved" → merge
       → request changes: "@implementer please address feedback" → cycle (max 3)
@@ -108,8 +109,9 @@ FastAPI app with `POST /webhook` endpoint.
 - Verify `X-Hub-Signature-256` with HMAC
 - Parse `X-GitHub-Event` header for event type
 - Extract `action` from payload
-- For comment events: extract `payload["comment"]["body"]`, regex scan for `@(claude|implementer|codex|human)\b`
-- Self-mention guard: agent comments are tagged with `<!-- agent:NAME -->` — when the comment author is the bot user AND the comment has this tag, extract the trailing @mention as a handoff signal (don't treat it as a new task)
+- **Handoff parsing (strict)**: only extract @mentions from the **last non-empty line** of a comment body, and only if the comment contains the `<!-- agent:NAME -->` tag. This prevents misfires from quoted text, code blocks, or casual @mentions mid-comment. Regex: scan the final line for `@(claude|implementer|codex|human)\b`.
+- For human-authored comments (no `<!-- agent:NAME -->` tag): also only parse @mentions from the last line, to allow humans to trigger agents explicitly while ignoring incidental mentions in discussion.
+- Ignore @mentions inside markdown code blocks (`` ` `` or ``` ``` ```) and blockquotes (`>`).
 - Deduplication via `X-GitHub-Delivery` header checked against `state.db`
 - Dispatch in `BackgroundTasks` so webhook returns 200 immediately
 
@@ -150,7 +152,7 @@ Functions:
 - `record_run(issue_number, repo, agent, tmux_window)` — insert new run
 - `update_run(run_id, status)` — mark completed/failed/stuck
 - `get_active_runs()` — for monitor to reconnect after restart
-- `is_duplicate(delivery_id)` — check + insert, return bool
+- `is_duplicate(delivery_id)` — atomic `INSERT ... ON CONFLICT DO NOTHING`, returns `True` if 0 rows affected (already seen). No separate check step — single statement eliminates race window under concurrent webhook handling.
 - `increment_cycle(issue_number, repo)` — bump count, return new count
 - `get_cycle_count(issue_number, repo)` — current count
 - `prune_deliveries(max_age_hours=1)` — cleanup old dedup entries
@@ -178,7 +180,7 @@ tmux management via `subprocess.run(["tmux", ...])` (not libtmux — more reliab
 Functions:
 - `ensure_session()` — create master tmux session if not exists
 - `create_agent_window(agent_name, issue_id, cli_command, prompt_file_path, repo_path)`:
-  1. Create named window: `tmux new-window -t SESSION -n "{agent}-{issue_id}"`
+  1. Create named window: `tmux new-window -t SESSION -n "{agent}-{issue_id}-{run_id}"` (run_id from state.db ensures uniqueness across retries)
   2. Send `cd {repo_path}` via send-keys
   3. Send CLI command via send-keys (e.g. `claude --dangerously-skip-permissions`)
   4. Wait briefly for CLI to initialize
@@ -205,7 +207,7 @@ Same structure but:
 - Role: "You are the IMPLEMENTER. Write code to fulfill the plan."
 - Includes plan text from planner's comment
 - Instructions: create feature branch, implement, commit, push, open PR with `Closes #{issue_number}`
-- Handoff: end PR description/comment with `@codex please review`
+- Handoff: after opening PR, post a **separate issue comment** (not PR comment) ending with `@codex please review PR #N`. This ensures the handoff triggers via `issue_comment` webhook only — no double-trigger from `pull_request.opened`.
 - Comment tag: `<!-- agent:implementer -->`
 
 ### 8. prompts/reviewer.py
@@ -315,7 +317,9 @@ System: `tmux`, `gh` CLI, `claude` CLI, `codex` CLI, `ngrok` (dev)
 | Risk | Mitigation |
 |---|---|
 | Claude Code alt-screen makes pane capture unreliable | Poll GitHub for new comments as primary completion signal |
-| Webhook storms from agent comments | Dedup by delivery ID in state.db, filter by `<!-- agent:X -->` tags |
+| Webhook storms from agent comments | Atomic dedup in state.db, strict last-line-only @mention parsing, `<!-- agent:X -->` tags |
+| Double-trigger on PR open + handoff comment | `pull_request.opened` ignored; reviewer only triggered via @mention in issue comment |
+| tmux window name collision on retry | Window names include run_id from state.db for uniqueness |
 | Agents hang on permission prompts | Use `--dangerously-skip-permissions` |
 | tmux session disappears | Monitor checks session existence, recreates if needed |
 | Review cycle loops | Hard max of 3 cycles, then @human escalation (persisted in state.db) |
