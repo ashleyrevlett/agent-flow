@@ -118,7 +118,7 @@ def _send_keys(window: str, keys: str, enter: bool = True):
     _tmux(cmd)
 
 
-def _handle_trust_prompt(window_name: str, agent_name: str, timeout: int = 15, poll_interval: float = 1.0):
+def _handle_trust_prompt(window_name: str, agent_name: str, timeout: int = 45, poll_interval: float = 1.0):
     """Wait for a CLI to initialize. Dismiss trust prompts automatically.
 
     Claude Code: asks "Do you want to trust...?" — expects 'y' + Enter.
@@ -136,6 +136,10 @@ def _handle_trust_prompt(window_name: str, agent_name: str, timeout: int = 15, p
     )
     # Codex shows a numbered menu with "Press enter to continue"
     codex_menu_pattern = re.compile(r"Press enter to continue|Yes,\s*continue", re.IGNORECASE)
+    # Claude Code "ready for input" markers — only these count as the
+    # actual input prompt. Codex prints "> You are in /path..." before
+    # the trust prompt, so a bare ">" check would exit prematurely.
+    claude_ready_pattern = re.compile(r"^(>.*\$|.*claude.*>|\$)\s*$", re.IGNORECASE)
     elapsed = 0.0
 
     while elapsed < timeout:
@@ -158,10 +162,13 @@ def _handle_trust_prompt(window_name: str, agent_name: str, timeout: int = 15, p
             time.sleep(3)
             return
 
-        # If the CLI input prompt appears without a trust prompt, it's ready
-        lines = [l.strip() for l in content.splitlines() if l.strip()]
-        if lines and (lines[-1].startswith(">") or lines[-1].endswith("$")):
-            return
+        # Early exit: CLI is ready without a trust prompt (already trusted).
+        # Only check for Claude Code — codex prints "> You are in /path..."
+        # before the trust prompt appears, which would false-positive here.
+        if agent_name in ("claude", "implementer"):
+            lines = [l.strip() for l in content.splitlines() if l.strip()]
+            if lines and claude_ready_pattern.match(lines[-1]):
+                return
 
     # Timeout — proceed anyway, CLI may have initialized without a trust prompt
     logger.warning("Trust prompt not detected in %s after %ds — proceeding", window_name, timeout)
