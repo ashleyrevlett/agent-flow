@@ -203,9 +203,16 @@ def create_agent_window(
     # prompt before sending the task instruction.
     _handle_trust_prompt(window_name, agent_name=agent_name)
 
-    # Send single-line task instruction
+    # Send single-line task instruction.
+    # For codex, send text and Enter as separate tmux commands — codex's
+    # terminal mode can swallow Enter when it's appended to the text arg.
     instruction = f"Read and execute the task in {prompt_file_path}"
-    _send_keys(window_name, instruction)
+    if agent_name == "codex":
+        _send_keys(window_name, instruction, enter=False)
+        time.sleep(0.3)
+        _tmux(["send-keys", "-t", f"{TMUX_SESSION_NAME}:{window_name}", "Enter"])
+    else:
+        _send_keys(window_name, instruction)
 
     logger.info("Spawned %s window: %s", agent_name, window_name)
     return window_name
