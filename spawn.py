@@ -145,9 +145,11 @@ def _handle_trust_prompt(window_name: str, agent_name: str, timeout: int = 15, p
 
         if trust_pattern.search(content):
             if codex_menu_pattern.search(content):
-                # Codex: option 1 (Yes) is pre-selected, just press Enter
+                # Codex: option 1 (Yes) is pre-selected, just press Enter.
+                # Send bare Enter key via tmux — _send_keys prepends an
+                # empty string arg that can prevent the keypress from reaching the pane.
                 logger.info("Codex trust prompt detected in %s — sending Enter", window_name)
-                _send_keys(window_name, "", enter=True)
+                _tmux(["send-keys", "-t", f"{TMUX_SESSION_NAME}:{window_name}", "Enter"])
             else:
                 # Claude Code: send 'y' to confirm
                 logger.info("Claude trust prompt detected in %s — sending 'y'", window_name)
