@@ -149,13 +149,14 @@ CREATE TABLE deliveries (
 ```
 
 Functions:
-- `record_run(issue_number, repo, agent, tmux_window)` — insert new run
+- `record_run(issue_number, repo, agent)` — insert new run with status "pending", returns `run_id` (autoincrement). Called **before** tmux window creation so run_id is available for window naming.
+- `update_run_window(run_id, tmux_window)` — set window name and status to "active" after successful spawn
 - `update_run(run_id, status)` — mark completed/failed/stuck
 - `get_active_runs()` — for monitor to reconnect after restart
 - `is_duplicate(delivery_id)` — atomic `INSERT ... ON CONFLICT DO NOTHING`, returns `True` if 0 rows affected (already seen). No separate check step — single statement eliminates race window under concurrent webhook handling.
 - `increment_cycle(issue_number, repo)` — bump count, return new count
 - `get_cycle_count(issue_number, repo)` — current count
-- `prune_deliveries(max_age_hours=1)` — cleanup old dedup entries
+- `prune_deliveries(max_age_hours=24)` — cleanup old dedup entries. Default 24h is conservative; GitHub can redeliver webhooks for up to several hours after initial failure. Configurable via `DEDUP_TTL_HOURS` env var.
 
 ### 4. dispatch.py
 
@@ -168,10 +169,11 @@ Core routing function `handle_event(event_type, action, payload)`:
    - PR diff: `gh pr diff {number}`
    - Issue body: from payload
 4. For reviewer handoffs: check `state.get_cycle_count()` — if >= MAX_REVIEW_CYCLES, route to @human instead
-5. Call appropriate prompt builder → writes prompt file to `/tmp/agent-flow/prompts/{agent}-{issue_id}.md`
-6. Call `spawn.create_agent_window()` with agent config and prompt file path
-7. Record run in `state.record_run()`
-8. For reviewer → implementer handoffs: `state.increment_cycle()`
+5. **Pre-create run row**: `run_id = state.record_run(issue_number, repo, agent)` — returns the auto-incremented id before tmux window exists
+6. Call appropriate prompt builder → writes prompt file to `/tmp/agent-flow/prompts/{agent}-{issue_id}.md`
+7. Call `spawn.create_agent_window(run_id, agent_name, issue_id, ...)` — uses run_id in window name
+8. Update run with tmux window name: `state.update_run_window(run_id, tmux_window)`
+9. For reviewer → implementer handoffs: `state.increment_cycle()`
 
 ### 5. spawn.py
 
@@ -179,7 +181,7 @@ tmux management via `subprocess.run(["tmux", ...])` (not libtmux — more reliab
 
 Functions:
 - `ensure_session()` — create master tmux session if not exists
-- `create_agent_window(agent_name, issue_id, cli_command, prompt_file_path, repo_path)`:
+- `create_agent_window(run_id, agent_name, issue_id, cli_command, prompt_file_path, repo_path)`:
   1. Create named window: `tmux new-window -t SESSION -n "{agent}-{issue_id}-{run_id}"` (run_id from state.db ensures uniqueness across retries)
   2. Send `cd {repo_path}` via send-keys
   3. Send CLI command via send-keys (e.g. `claude --dangerously-skip-permissions`)
