@@ -344,30 +344,29 @@ def _dispatch_agent(
         logger.error("Unknown agent: %s", agent)
         return
 
-    # Enqueue
-    run_id = state.enqueue_run(issue_number, repo, agent, prompt_file)
-    logger.info("Enqueued run %d for %s on issue #%s", run_id, agent, issue_number)
-
-    # Store pr_branch so the reviewer worktree targets the right branch.
-    # For code review this is mandatory — fail fast rather than silently
-    # reviewing detached HEAD on the wrong commit.
+    # For code-review runs, resolve the PR branch BEFORE enqueue so the
+    # INSERT is atomic with the branch value. try_promote() can fire the
+    # moment a queued row exists; a post-enqueue update_run_pr_branch call
+    # has a race window where promotion can happen while pr_branch is NULL.
+    pr_branch_for_run: Optional[str] = None
     if agent == "codex" and stage == "code_review":
         if pr_number is None:
             logger.error(
-                "Code review dispatched for issue #%s but no pr_number provided — aborting",
+                "Code review dispatched for issue #%s but no pr_number — aborting (no row created)",
                 issue_number,
             )
-            state.cancel_queued_run(run_id)
             return
-        pr_branch = _fetch_pr_branch(repo, pr_number)
-        if not pr_branch:
+        pr_branch_for_run = _fetch_pr_branch(repo, pr_number)
+        if not pr_branch_for_run:
             logger.error(
-                "Could not resolve PR branch for PR #%s (issue #%s) — aborting code review",
+                "Could not resolve PR branch for PR #%s (issue #%s) — aborting (no row created)",
                 pr_number, issue_number,
             )
-            state.cancel_queued_run(run_id)
             return
-        state.update_run_pr_branch(run_id, pr_branch)
+
+    # Enqueue — pr_branch stored atomically for code-review runs
+    run_id = state.enqueue_run(issue_number, repo, agent, prompt_file, pr_branch=pr_branch_for_run)
+    logger.info("Enqueued run %d for %s on issue #%s", run_id, agent, issue_number)
 
     # Try to promote
     run = state.try_promote(agent)
@@ -552,9 +551,9 @@ def _parse_mention(body: str) -> Optional[str]:
         if not stripped:
             continue
         if fenced[idx]:
-            return None
+            continue
         if stripped.startswith(">"):
-            return None
+            continue
         # Strip inline backtick spans before searching for a mention so that
         # `@some-handle` in code does not route.
         sanitised = re.sub(r"`[^`]*`", "", stripped)

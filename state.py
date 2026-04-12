@@ -123,11 +123,12 @@ def init_db():
 # Runs
 # ---------------------------------------------------------------------------
 
-def enqueue_run(issue_number: int, repo: str, agent: str, prompt_file: str) -> int:
+def enqueue_run(issue_number: int, repo: str, agent: str, prompt_file: str, pr_branch: Optional[str] = None) -> int:
     with _conn() as con:
         cur = con.execute(
-            "INSERT INTO runs (issue_number, repo, agent, status, prompt_file) VALUES (?, ?, ?, 'queued', ?)",
-            (issue_number, repo, agent, prompt_file),
+            "INSERT INTO runs (issue_number, repo, agent, status, prompt_file, pr_branch) "
+            "VALUES (?, ?, ?, 'queued', ?, ?)",
+            (issue_number, repo, agent, prompt_file, pr_branch),
         )
         return cur.lastrowid
 

@@ -60,6 +60,16 @@ class TestParseMention:
         body = "Run `@codex` to lint"
         assert dispatch._parse_mention(body) is None
 
+    def test_scans_past_trailing_blockquote(self):
+        """A mention before a trailing blockquote should still be found."""
+        body = "@implementer please implement\n> quoted agent output"
+        assert dispatch._parse_mention(body) == "implementer"
+
+    def test_scans_past_trailing_fenced_block(self):
+        """A mention before a trailing fenced block should still be found."""
+        body = "@codex please review\n```\nsome code\n```"
+        assert dispatch._parse_mention(body) == "codex"
+
 
 # ---------------------------------------------------------------------------
 # _parse_status
@@ -254,22 +264,13 @@ class TestAuthFiltering:
 # ---------------------------------------------------------------------------
 
 class TestCodeReviewBranchResolution:
-    """Enqueue → branch-lookup failure must cancel the queued run, not leave it promotable."""
+    """PR branch must be resolved before enqueue; no row is created on failure."""
 
     def _dispatch_code_review(self, pr_branch_return):
-        """Call _dispatch_agent for a code-review and return the run_id that was enqueued."""
-        captured = {}
-
-        def fake_enqueue(issue_number, repo, agent, prompt_file):
-            run_id = 42
-            captured["run_id"] = run_id
-            return run_id
-
-        with mock.patch.object(dispatch.state, "enqueue_run", side_effect=fake_enqueue), \
+        """Call _dispatch_agent for a code-review; return (mock_enqueue, mock_cancel)."""
+        with mock.patch.object(dispatch.state, "enqueue_run", return_value=42) as mock_enqueue, \
              mock.patch.object(dispatch.state, "cancel_queued_run") as mock_cancel, \
-             mock.patch.object(dispatch.state, "fail_run") as mock_fail, \
              mock.patch.object(dispatch.state, "try_promote", return_value=None), \
-             mock.patch.object(dispatch.state, "update_run_pr_branch"), \
              mock.patch.object(dispatch, "_fetch_pr_branch", return_value=pr_branch_return), \
              mock.patch.object(dispatch, "_fetch_pr_context", return_value=(99, "diff", "desc")), \
              mock.patch.object(dispatch, "_fetch_comments", return_value=[]), \
@@ -283,15 +284,18 @@ class TestCodeReviewBranchResolution:
                 stage="code_review",
                 comment_body="",
             )
-            return captured.get("run_id"), mock_cancel, mock_fail
+            return mock_enqueue, mock_cancel
 
-    def test_missing_pr_branch_cancels_queued_run(self):
-        """When _fetch_pr_branch returns None, the queued run must be cancelled."""
-        run_id, mock_cancel, mock_fail = self._dispatch_code_review(pr_branch_return=None)
-        mock_cancel.assert_called_once_with(run_id)
-        mock_fail.assert_not_called()
+    def test_missing_pr_branch_never_enqueues(self):
+        """When _fetch_pr_branch returns None, no run row is created at all."""
+        mock_enqueue, mock_cancel = self._dispatch_code_review(pr_branch_return=None)
+        mock_enqueue.assert_not_called()
+        mock_cancel.assert_not_called()
 
-    def test_successful_branch_does_not_cancel(self):
-        """When PR branch resolves, cancel_queued_run must not be called."""
-        _, mock_cancel, mock_fail = self._dispatch_code_review(pr_branch_return="feature/my-branch")
+    def test_successful_branch_enqueues_with_branch(self):
+        """When PR branch resolves, enqueue_run is called with pr_branch set."""
+        mock_enqueue, mock_cancel = self._dispatch_code_review(pr_branch_return="feature/my-branch")
+        mock_enqueue.assert_called_once()
+        _, kwargs = mock_enqueue.call_args
+        assert kwargs.get("pr_branch") == "feature/my-branch"
         mock_cancel.assert_not_called()
