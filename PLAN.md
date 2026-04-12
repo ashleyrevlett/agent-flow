@@ -236,7 +236,7 @@ Functions:
   implementing → code_review     (implementer posts IMPLEMENTATION_COMPLETE → @codex)
   code_review → implementing     (reviewer requests code changes → @implementer)
   code_review → approved         (reviewer approves + merges — terminal)
-  any → escalated                (@human — terminal until human acts)
+- `escalate(issue_number, repo)` — separate function, not `transition()`. Sets stage to `escalated` regardless of current stage. This avoids conflicting with the strict expected-stage contract of `transition()`.
   ```
 - `get_review_count(issue_number, repo, review_type)` — returns plan_review_count or code_review_count
 - `increment_review_count(issue_number, repo, review_type)` — bump the appropriate counter
@@ -340,7 +340,7 @@ Functions:
 - **@claude (planner)**: Uses Claude Code's native `-w plan-{issue_id}-{run_id}` flag. Worktree created at `<repo>/.claude/worktrees/plan-{issue_id}-{run_id}/`. Auto-cleaned up by Claude Code on exit.
 - **@implementer**: Uses Claude Code's native `-w feature-{issue_id}-{run_id}` flag. Same auto-cleanup behavior. Branch is `worktree-feature-{issue_id}-{run_id}`.
 - **@codex (reviewer, code review)**: Worktree created manually by spawn.py via `git worktree add` on the PR branch. Codex operates in this directory so it can read the actual files on the correct branch. Cleaned up by `spawn.cleanup_worktree()` after run completes.
-- **@codex (reviewer, plan review)**: No worktree needed — no PR or code changes exist yet. Codex operates from the main repo directory. The plan is in the issue thread, not in files.
+- **@codex (reviewer, plan review)**: No code changes exist yet, but to maintain the "main checkout never modified" invariant, Codex still operates from a read-only worktree. spawn.py creates a disposable worktree on the default branch: `git worktree add /tmp/agent-flow/worktrees/planreview-{issue_id}-{run_id} HEAD --detach`. This is read-only in practice (plan review only reads issue thread context, not files), and is cleaned up normally.
 - The main repo checkout is never modified by agents. All work happens in worktrees.
 
 ### 6. roles/planner.md (static system prompt)
