@@ -8,11 +8,21 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# GitHub
-GITHUB_WEBHOOK_SECRET: str = os.environ["GITHUB_WEBHOOK_SECRET"]
-GITHUB_TOKEN: str = os.environ["GITHUB_TOKEN"]
-GITHUB_REPO: str = os.environ["GITHUB_REPO"]  # owner/repo
-BOT_GITHUB_USERNAME: str = os.getenv("BOT_GITHUB_USERNAME", "")
+# Git provider: "github" or "gitlab"
+GIT_PROVIDER: str = os.getenv("GIT_PROVIDER", "github")
+
+# Git platform (generic names, with backward-compat aliases)
+WEBHOOK_SECRET: str = os.environ.get("WEBHOOK_SECRET", os.environ.get("GITHUB_WEBHOOK_SECRET", ""))
+API_TOKEN: str = os.environ.get("API_TOKEN", os.environ.get("GITHUB_TOKEN", ""))
+GIT_REPO: str = os.environ.get("GIT_REPO", os.environ.get("GITHUB_REPO", ""))
+BOT_USERNAME: str = os.environ.get("BOT_USERNAME", os.environ.get("BOT_GITHUB_USERNAME", ""))
+GIT_BASE_URL: str = os.getenv("GIT_BASE_URL", "")  # e.g. "https://gitlab.company.com"
+
+# Backward-compat aliases (existing .env files keep working)
+GITHUB_WEBHOOK_SECRET: str = WEBHOOK_SECRET
+GITHUB_TOKEN: str = API_TOKEN
+GITHUB_REPO: str = GIT_REPO
+BOT_GITHUB_USERNAME: str = BOT_USERNAME
 
 # Telegram
 TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")

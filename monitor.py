@@ -5,10 +5,8 @@ circuit breaker management, restart recovery.
 
 import asyncio
 import hashlib
-import json
 import logging
 import re
-import subprocess
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -16,12 +14,14 @@ import state
 import spawn
 import notifications as telegram
 from config import (
-    GITHUB_REPO,
     MONITOR_POLL_SECONDS,
     IDLE_TIMEOUT_SECONDS,
 )
+from provider import get_provider
 
 logger = logging.getLogger(__name__)
+
+_provider = get_provider()
 
 # Track pane content hashes and last-change timestamps per run_id
 _pane_hashes: dict[int, str] = {}
@@ -36,10 +36,6 @@ _RATE_LIMIT_PATTERNS = re.compile(
     r"rate limit|429|too many requests|authentication failed|401",
     re.IGNORECASE,
 )
-
-# Agent completion/APPROVED patterns in GitHub comments
-_AGENT_TAG_RE = re.compile(r"<!--\s*agent:(\w+)\s*-->")
-_STATUS_RE = re.compile(r"STATUS:\s*(\w+(?:_\w+)*)")
 
 
 async def monitor_loop():
@@ -140,7 +136,7 @@ async def _poll():
                 resume_at = _get_breaker_resume(agent)
                 telegram.send_notification(
                     f"Circuit breaker tripped for @{agent} — rate limited. Resuming at {resume_at}.",
-                    issue_url=f"https://github.com/{repo}/issues/{issue_number}",
+                    issue_url=_provider.issue_url(repo, issue_number),
                 )
             else:
                 excerpt = _extract_error(pane_content)
@@ -163,18 +159,19 @@ async def _poll():
             # Proactively reset if breaker was previously tripped but has now expired
             _try_reset_breaker(agent)
 
-        # --- GitHub comment polling (primary completion signal) ---
-        # Claude Code uses alt-screen; pane exit is unreliable. Poll GitHub instead.
-        completed, status_token = await _check_github_completion(
-            repo, issue_number, agent, run["started_at"]
+        # --- Comment polling (primary completion signal) ---
+        # Claude Code uses alt-screen; pane exit is unreliable. Poll git platform instead.
+        iso_started_at = _sqlite_ts_to_iso(run["started_at"])
+        completed, status_token = _provider.check_completion(
+            repo, issue_number, agent, iso_started_at
         )
         if completed:
-            logger.info("Run %d completion detected via GitHub comment (STATUS: %s)", run_id, status_token)
+            logger.info("Run %d completion detected via comment (STATUS: %s)", run_id, status_token)
             _handle_completion(run, status_token)
 
 
 def _handle_completion(run, status_token: Optional[str]):
-    """Handle a completion event detected via GitHub comment polling."""
+    """Handle a completion event detected via comment polling."""
     run_id = run["id"]
     agent = run["agent"]
     issue_number = run["issue_number"]
@@ -202,9 +199,8 @@ def _handle_completion(run, status_token: Optional[str]):
 def _sqlite_ts_to_iso(ts: str) -> str:
     """Convert SQLite CURRENT_TIMESTAMP ("YYYY-MM-DD HH:MM:SS") to ISO 8601 UTC.
 
-    GitHub comment timestamps are "YYYY-MM-DDTHH:MM:SSZ". JQ string ordering
-    only works correctly when both sides share the same format, so we normalise
-    the SQLite value before embedding it in the JQ expression.
+    Git platform comment timestamps use ISO 8601. Normalising the SQLite
+    value ensures consistent comparison regardless of provider.
     """
     try:
         dt = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
@@ -212,39 +208,6 @@ def _sqlite_ts_to_iso(ts: str) -> str:
     except ValueError:
         # Already ISO or unrecognised — return as-is and let JQ decide.
         return ts
-
-
-async def _check_github_completion(
-    repo: str, issue_number: int, agent: str, run_started_at: str
-) -> tuple[bool, Optional[str]]:
-    """
-    Poll GitHub for a completion comment from this agent on this issue that
-    was posted AFTER the run started. Returns (completed, status_token).
-
-    Guards against stale comments from prior runs on the same issue
-    prematurely completing a new run.
-    """
-    iso_started_at = _sqlite_ts_to_iso(run_started_at)
-    try:
-        result = subprocess.run(
-            ["gh", "api", f"repos/{repo}/issues/{issue_number}/comments",
-             "--jq",
-             f'[.[] | select(.body | contains("<!-- agent:{agent} -->"))'
-             f' | select(.created_at > "{iso_started_at}")] | last'],
-            capture_output=True, text=True, check=True,
-        )
-        raw = result.stdout.strip()
-        if not raw or raw == "null":
-            return False, None
-
-        comment = json.loads(raw)
-        body = comment.get("body", "")
-        match = _STATUS_RE.search(body)
-        if match:
-            return True, match.group(1)
-        return False, None
-    except (subprocess.CalledProcessError, json.JSONDecodeError):
-        return False, None
 
 
 def _extract_error(pane_content: str) -> str:

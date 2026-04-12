@@ -19,12 +19,14 @@ def build(
     pr_diff: str | None = None,
     pr_description: str | None = None,
     review_comments: str | None = None,
+    provider=None,
 ) -> str:
     """
     Write a task prompt file for the implementer. Returns the file path.
 
     When invoked for initial implementation: pr_number, pr_diff, review_comments are None.
     When invoked to address review feedback: all PR fields are populated.
+    provider: GitProvider instance for CLI templates
     """
     os.makedirs(PROMPT_DIR, exist_ok=True)
 
@@ -49,12 +51,15 @@ def build(
     pr_section = ""
     if pr_number:
         pr_section = f"""
-## Existing PR
+## Existing PR/MR
 
-PR #{pr_number}
-{f"Branch: see PR" if pr_number else ""}
+#{pr_number}
 {f"Description: {pr_description}" if pr_description else ""}
 """
+
+    comment_cmd = provider.comment_cli(issue_number, repo)
+    mr_create_cmd = provider.mr_create_cli(repo)
+    link_syntax = provider.issue_link_syntax(issue_number)
 
     content = f"""# Implementer Task — Issue #{issue_number}
 
@@ -81,8 +86,8 @@ Implement the plan above following the instructions in your system prompt (roles
 
 Key reminders:
 - Branch: `issue-{issue_number}-<short-description>` from latest main
-- Open a PR with `gh pr create --repo {repo} ...` with "Closes #{issue_number}" in the body
-- Post your handoff on the **issue** (not the PR): `gh issue comment {issue_number} --repo {repo} --body "..."`
+- Open a PR/MR with `{mr_create_cmd}` with "{link_syntax}" in the body
+- Post your handoff on the **issue** (not the PR/MR): `{comment_cmd}`
 - Your comment must start with `<!-- agent:implementer -->`
 - End with `STATUS: IMPLEMENTATION_COMPLETE` and `@codex please review PR #N.`
 - Never silently exit — always post an issue comment with a STATUS line

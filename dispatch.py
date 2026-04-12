@@ -5,18 +5,15 @@ builds prompts, enqueues and spawns agents.
 
 import logging
 import re
-import subprocess
 from typing import Optional
 
 import state
 from config import (
     AGENTS,
-    GITHUB_REPO,
     MAX_REVIEW_CYCLES,
     MAX_DECOMPOSITION_DEPTH,
-    TRUSTED_AUTHOR_ASSOCIATIONS,
-    BOT_GITHUB_USERNAME,
 )
+from provider import WebhookEvent, get_provider
 from prompts import planner as planner_prompt
 from prompts import implementer as implementer_prompt
 from prompts import reviewer as reviewer_prompt
@@ -24,6 +21,8 @@ import spawn
 import notifications as telegram
 
 logger = logging.getLogger(__name__)
+
+_provider = get_provider()
 
 # Regex for @mention on the last non-empty line
 _MENTION_RE = re.compile(r"@(claude|implementer|codex|human)\b")
@@ -42,34 +41,31 @@ _PARENT_RE = re.compile(r"Parent:\s*#(\d+)", re.IGNORECASE)
 # Entry point
 # ---------------------------------------------------------------------------
 
-def handle_event(event_type: str, action: str, payload: dict, delivery_id: str):
-    """Route a GitHub webhook event to the appropriate agent."""
+def handle_event(event: WebhookEvent):
+    """Route a webhook event to the appropriate agent."""
 
-    if state.is_duplicate(delivery_id):
-        logger.info("Duplicate delivery %s — skipping", delivery_id)
+    if state.is_duplicate(event.delivery_id):
+        logger.info("Duplicate delivery %s — skipping", event.delivery_id)
         return
 
     try:
-        _route(event_type, action, payload)
+        _route(event)
     except Exception:
-        logger.exception("Error handling event %s/%s", event_type, action)
+        logger.exception("Error handling event %s", event.kind)
 
 
-def _route(event_type: str, action: str, payload: dict):
-    repo = payload.get("repository", {}).get("full_name", GITHUB_REPO)
+def _route(event: WebhookEvent):
+    repo = event.repo
 
     # ------------------------------------------------------------------
-    # issues.opened
+    # issue_opened
     # ------------------------------------------------------------------
-    if event_type == "issues" and action == "opened":
-        issue = payload["issue"]
-        issue_number = issue["number"]
-        issue_title = issue.get("title", "")
-        issue_body = issue.get("body", "") or ""
+    if event.kind == "issue_opened":
+        issue_number = event.issue_number
+        issue_body = event.issue_body
 
         # Self-triggered filter
-        opener = issue.get("user", {}).get("login", "")
-        if opener == BOT_GITHUB_USERNAME:
+        if event.is_bot:
             logger.info("Ignoring self-opened issue #%s", issue_number)
             return
 
@@ -88,49 +84,36 @@ def _route(event_type: str, action: str, payload: dict):
             state.record_dependency(issue_number, depends_on, repo)
 
         if not state.transition(issue_number, repo, "open", "planning"):
-            logger.warning("Issue #%s not in 'open' stage — ignoring issues.opened", issue_number)
+            logger.warning("Issue #%s not in 'open' stage — ignoring issue_opened", issue_number)
             return
 
         _dispatch_agent(
             agent="claude",
             issue_number=issue_number,
             repo=repo,
-            issue_title=issue_title,
+            issue_title=event.issue_title,
             issue_body=issue_body,
             stage="planning",
         )
         return
 
     # ------------------------------------------------------------------
-    # issue_comment.created
+    # comment_created
     # ------------------------------------------------------------------
-    if event_type == "issue_comment" and action == "created":
-        comment = payload["comment"]
-        issue = payload["issue"]
-        issue_number = issue["number"]
-        repo = payload.get("repository", {}).get("full_name", GITHUB_REPO)
-        issue_title = issue.get("title", "")
-        issue_body = issue.get("body", "") or ""
-        comment_body = comment.get("body", "") or ""
-        commenter = comment.get("user", {}).get("login", "")
-        author_association = comment.get("author_association", "")
-        is_agent_comment = "<!-- agent:" in comment_body
+    if event.kind == "comment_created":
+        issue_number = event.issue_number
+        comment_body = event.comment_body or ""
 
         # Parse @mention from last non-empty line
         mention = _parse_mention(comment_body)
 
-        if is_agent_comment:
+        if event.is_agent_comment:
             # Agent-tagged comments drive pipeline handoffs.
-            # Accept only from BOT_GITHUB_USERNAME (our bot) OR trusted collaborators.
-            # This prevents external users from spoofing <!-- agent:... --> tags.
-            is_trusted = (
-                (BOT_GITHUB_USERNAME and commenter == BOT_GITHUB_USERNAME)
-                or author_association in TRUSTED_AUTHOR_ASSOCIATIONS
-            )
-            if not is_trusted:
+            # Trust was pre-computed by the provider.
+            if not event.is_trusted:
                 logger.info(
-                    "Ignoring agent-tagged comment from untrusted user %s (%s) on #%s",
-                    commenter, author_association, issue_number,
+                    "Ignoring agent-tagged comment from untrusted user %s on #%s",
+                    event.commenter, issue_number,
                 )
                 return
             # Ignore bare agent-tagged comments with no STATUS and no mention
@@ -138,17 +121,17 @@ def _route(event_type: str, action: str, payload: dict):
             if mention is None and status_check is None:
                 return
         else:
-            # Human-authored comments: require trusted collaborator AND a mention.
+            # Human-authored comments: require trusted + mention.
             # Filter bot's own non-agent comments to prevent loops.
-            if commenter == BOT_GITHUB_USERNAME:
+            if event.is_bot:
                 logger.info("Ignoring non-agent self-comment on #%s", issue_number)
                 return
             if mention is None:
                 return
-            if author_association not in TRUSTED_AUTHOR_ASSOCIATIONS:
+            if not event.is_trusted:
                 logger.info(
-                    "Ignoring @%s mention from untrusted user %s (%s)",
-                    mention, commenter, author_association,
+                    "Ignoring @%s mention from untrusted user %s",
+                    mention, event.commenter,
                 )
                 return
 
@@ -159,8 +142,8 @@ def _route(event_type: str, action: str, payload: dict):
         _handle_comment(
             issue_number=issue_number,
             repo=repo,
-            issue_title=issue_title,
-            issue_body=issue_body,
+            issue_title=event.issue_title,
+            issue_body=event.issue_body,
             mention=mention,
             status=status,
             comment_body=comment_body,
@@ -168,19 +151,17 @@ def _route(event_type: str, action: str, payload: dict):
         return
 
     # ------------------------------------------------------------------
-    # issues.closed — satisfy dependencies
+    # issue_closed — satisfy dependencies
     # ------------------------------------------------------------------
-    if event_type == "issues" and action == "closed":
-        issue_number = payload["issue"]["number"]
-        state.satisfy_dependency(issue_number, repo)
+    if event.kind == "issue_closed":
+        state.satisfy_dependency(event.issue_number, repo)
         return
 
     # ------------------------------------------------------------------
-    # workflow_run.completed — log only
+    # workflow_completed — log only
     # ------------------------------------------------------------------
-    if event_type == "workflow_run" and action == "completed":
-        conclusion = payload.get("workflow_run", {}).get("conclusion", "unknown")
-        logger.info("CI workflow completed with conclusion: %s", conclusion)
+    if event.kind == "workflow_completed":
+        logger.info("CI workflow completed with conclusion: %s", event.comment_body)
         return
 
 
@@ -221,7 +202,7 @@ def _handle_comment(
         state.escalate(issue_number, repo)
         telegram.send_notification(
             f"Escalated to @human: issue #{issue_number} in {repo}. Status: {status}",
-            issue_url=f"https://github.com/{repo}/issues/{issue_number}",
+            issue_url=_provider.issue_url(repo, issue_number),
         )
         return
 
@@ -252,7 +233,7 @@ def _handle_comment(
             state.escalate(issue_number, repo)
             telegram.send_notification(
                 f"Max review cycles reached for issue #{issue_number} ({review_type} review). Escalating.",
-                issue_url=f"https://github.com/{repo}/issues/{issue_number}",
+                issue_url=_provider.issue_url(repo, issue_number),
             )
             return
 
@@ -295,14 +276,14 @@ def _dispatch_agent(
     comment_body: str = "",
 ):
     """Fetch context, build prompt, enqueue, try to spawn."""
-    comment_thread = _fetch_comments(repo, issue_number)
+    comment_thread = _provider.fetch_comments(repo, issue_number)
 
-    # PR context for code-facing stages
-    pr_number = None
-    pr_diff = None
-    pr_description = None
+    # MR context for code-facing stages
+    mr_number = None
+    mr_diff = None
+    mr_description = None
     if stage in ("code_review", "implementing"):
-        pr_number, pr_diff, pr_description = _fetch_pr_context(repo, issue_number)
+        mr_number, mr_diff, mr_description = _provider.fetch_mr_context(repo, issue_number)
 
     # Build prompt file
     if agent == "claude":
@@ -315,6 +296,7 @@ def _dispatch_agent(
             comment_thread=comment_thread,
             decomposition_depth=depth,
             max_decomposition_depth=MAX_DECOMPOSITION_DEPTH,
+            provider=_provider,
         )
     elif agent == "implementer":
         prompt_file = implementer_prompt.build(
@@ -323,9 +305,10 @@ def _dispatch_agent(
             issue_title=issue_title,
             issue_body=issue_body,
             comment_thread=comment_thread,
-            pr_number=pr_number,
-            pr_diff=pr_diff,
-            pr_description=pr_description,
+            pr_number=mr_number,
+            pr_diff=mr_diff,
+            pr_description=mr_description,
+            provider=_provider,
         )
     elif agent == "codex":
         review_mode = "plan" if stage == "plan_review" else "code"
@@ -336,31 +319,31 @@ def _dispatch_agent(
             issue_body=issue_body,
             comment_thread=comment_thread,
             review_mode=review_mode,
-            pr_number=pr_number,
-            pr_diff=pr_diff,
-            pr_description=pr_description,
+            pr_number=mr_number,
+            pr_diff=mr_diff,
+            pr_description=mr_description,
+            provider=_provider,
         )
     else:
         logger.error("Unknown agent: %s", agent)
         return
 
-    # For code-review runs, resolve the PR branch BEFORE enqueue so the
+    # For code-review runs, resolve the MR branch BEFORE enqueue so the
     # INSERT is atomic with the branch value. try_promote() can fire the
-    # moment a queued row exists; a post-enqueue update_run_pr_branch call
-    # has a race window where promotion can happen while pr_branch is NULL.
+    # moment a queued row exists; a post-enqueue update is racy.
     pr_branch_for_run: Optional[str] = None
     if agent == "codex" and stage == "code_review":
-        if pr_number is None:
+        if mr_number is None:
             logger.error(
-                "Code review dispatched for issue #%s but no pr_number — aborting (no row created)",
+                "Code review dispatched for issue #%s but no MR found — aborting (no row created)",
                 issue_number,
             )
             return
-        pr_branch_for_run = _fetch_pr_branch(repo, pr_number)
+        pr_branch_for_run = _provider.fetch_mr_branch(repo, mr_number)
         if not pr_branch_for_run:
             logger.error(
-                "Could not resolve PR branch for PR #%s (issue #%s) — aborting (no row created)",
-                pr_number, issue_number,
+                "Could not resolve MR branch for MR #%s (issue #%s) — aborting (no row created)",
+                mr_number, issue_number,
             )
             return
 
@@ -395,7 +378,7 @@ def _spawn_run(run):
                 issue_id=issue_id,
                 run_id=run_id,
                 pr_branch=pr_branch,
-                repo_path=REPO_LOCAL_PATH,  # always the local clone, not GitHub repo name
+                repo_path=REPO_LOCAL_PATH,
             )
         except Exception:
             logger.exception("Failed to create reviewer worktree for run %d", run_id)
@@ -427,89 +410,6 @@ def drain_queue(agent: str):
     if run is None:
         return
     _spawn_run(run)
-
-
-# ---------------------------------------------------------------------------
-# Context fetching
-# ---------------------------------------------------------------------------
-
-def _fetch_comments(repo: str, issue_number: int) -> list[dict]:
-    """Fetch all comments for an issue as a list of dicts."""
-    import json
-    try:
-        # Use --paginate without --jq so output is a valid JSON array per page.
-        # With --paginate, gh concatenates pages — output may be multiple arrays.
-        # Use --jq '.' at the array level to flatten into newline-separated objects.
-        result = subprocess.run(
-            ["gh", "api", f"repos/{repo}/issues/{issue_number}/comments",
-             "--paginate"],
-            capture_output=True, text=True, check=True,
-        )
-        raw = result.stdout.strip()
-        if not raw:
-            return []
-        # gh --paginate outputs one JSON array per page, concatenated.
-        # Wrap in a single parse by collecting all objects via decoder.
-        objects = []
-        decoder = json.JSONDecoder()
-        pos = 0
-        while pos < len(raw):
-            while pos < len(raw) and raw[pos] in " \t\n\r":
-                pos += 1
-            if pos >= len(raw):
-                break
-            obj, end = decoder.raw_decode(raw, pos)
-            if isinstance(obj, list):
-                objects.extend(obj)
-            else:
-                objects.append(obj)
-            pos = end
-        return objects
-    except (subprocess.CalledProcessError, json.JSONDecodeError) as exc:
-        logger.warning("Failed to fetch comments for #%s: %s", issue_number, exc)
-        return []
-
-
-def _fetch_pr_context(repo: str, issue_number: int) -> tuple[Optional[int], Optional[str], Optional[str]]:
-    """Find the PR linked to this issue and return (pr_number, diff, description)."""
-    import json
-    try:
-        result = subprocess.run(
-            ["gh", "pr", "list", "--repo", repo,
-             "--search", f"Closes #{issue_number}", "--json", "number,title,body,headRefName"],
-            capture_output=True, text=True, check=True,
-        )
-        prs = json.loads(result.stdout or "[]")
-        if not prs:
-            return None, None, None
-        pr = prs[0]
-        pr_number = pr["number"]
-        pr_description = pr.get("body", "")
-
-        diff_result = subprocess.run(
-            ["gh", "pr", "diff", str(pr_number), "--repo", repo],
-            capture_output=True, text=True, check=True,
-        )
-        return pr_number, diff_result.stdout, pr_description
-    except subprocess.CalledProcessError as exc:
-        logger.warning("Failed to fetch PR context for #%s: %s", issue_number, exc.stderr)
-        return None, None, None
-
-
-def _fetch_pr_branch(repo: str, pr_number: int) -> Optional[str]:
-    """Return the head branch name for a given PR number."""
-    import json
-    try:
-        result = subprocess.run(
-            ["gh", "pr", "view", str(pr_number), "--repo", repo,
-             "--json", "headRefName"],
-            capture_output=True, text=True, check=True,
-        )
-        data = json.loads(result.stdout)
-        return data.get("headRefName")
-    except (subprocess.CalledProcessError, json.JSONDecodeError) as exc:
-        logger.warning("Failed to fetch PR branch for PR #%s: %s", pr_number, exc)
-        return None
 
 
 # ---------------------------------------------------------------------------

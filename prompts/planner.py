@@ -17,11 +17,13 @@ def build(
     comment_thread: list[dict],
     decomposition_depth: int = 0,
     max_decomposition_depth: int = 1,
+    provider=None,
 ) -> str:
     """
     Write a task prompt file for the planner. Returns the file path.
 
-    comment_thread: list of dicts with keys: author, body, created_at
+    comment_thread: list of dicts with keys: user.login, body, created_at
+    provider: GitProvider instance for CLI templates
     """
     os.makedirs(PROMPT_DIR, exist_ok=True)
 
@@ -38,6 +40,8 @@ def build(
         )
 
     thread_text = _format_thread(comment_thread)
+
+    comment_cmd = provider.comment_cli(issue_number, repo)
 
     content = f"""# Planner Task — Issue #{issue_number}
 
@@ -59,7 +63,7 @@ Issue: #{issue_number} — {issue_title}
 Analyze the issue above and produce a plan following the instructions in your system prompt (roles/planner.md).
 
 Key reminders:
-- Post your output as a GitHub issue comment via: `gh issue comment {issue_number} --repo {repo} --body "..."`
+- Post your output as an issue comment via: `{comment_cmd}`
 - Your comment must start with `<!-- agent:claude -->`
 - Use Mode A (direct plan with STATUS: PLAN_COMPLETE) or Mode B (decompose with STATUS: DECOMPOSED)
 - In Mode A: end with `@codex please review this plan.`

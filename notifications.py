@@ -6,7 +6,7 @@ import asyncio
 import logging
 from typing import Optional
 
-from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, GITHUB_REPO
+from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, GIT_REPO
 
 logger = logging.getLogger(__name__)
 
@@ -88,23 +88,19 @@ async def _start_bot():
 
 
 async def _cmd_create_issue(update, context):
-    """Create a GitHub issue from Telegram: /create_issue <title>"""
-    import subprocess
+    """Create an issue from Telegram: /create_issue <title>"""
     if not context.args:
         await update.message.reply_text("Usage: /create_issue <issue title>")
         return
 
     title = " ".join(context.args)
     try:
-        result = subprocess.run(
-            ["gh", "issue", "create", "--repo", GITHUB_REPO,
-             "--title", title, "--body", "(Created via Telegram)"],
-            capture_output=True, text=True, check=True,
-        )
-        issue_url = result.stdout.strip()
+        from provider import get_provider
+        provider = get_provider()
+        issue_url = provider.create_issue(GIT_REPO, title, "(Created via Telegram)")
         await update.message.reply_text(f"Created: {issue_url}")
-    except subprocess.CalledProcessError as exc:
-        await update.message.reply_text(f"Failed: {exc.stderr}")
+    except Exception as exc:
+        await update.message.reply_text(f"Failed: {exc}")
 
 
 async def _cmd_status(update, context):
