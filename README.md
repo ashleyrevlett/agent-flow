@@ -49,6 +49,54 @@ python main.py
 - GitHub CLI (`gh`) when `GIT_PROVIDER=github`
 - GitLab CLI (`glab`) when `GIT_PROVIDER=gitlab`
 
+## How to Use
+
+### Start a task
+
+Create an issue in your repo. That's it — the webhook fires, `@claude` picks it up and begins planning.
+
+No special labels or formatting required. Write the issue like you'd write it for a human developer: describe what you want done, include context, acceptance criteria, etc.
+
+### Pipeline flow
+
+1. **Issue created** — `@claude` (planner) reads the issue and posts a plan as a comment
+2. **Plan review** — `@codex` (reviewer) evaluates the plan, either approves or requests changes
+3. **Implementation** — `@implementer` writes code, opens a PR/MR, posts a handoff comment
+4. **Code review** — `@codex` reviews the diff, either approves+merges or requests changes
+5. Each review phase retries up to `MAX_REVIEW_CYCLES` (default 3) before escalating
+
+### Intervene at any point
+
+Post a comment on the issue with `@human` on the last line to escalate. The pipeline pauses and sends a Telegram alert (if configured).
+
+### Declare dependencies between issues
+
+Add `Depends-on: #N` in the issue body. The dependent issue won't start until issue #N is closed.
+
+```
+Implement the search API.
+
+Depends-on: #12
+```
+
+### Decompose large issues
+
+If `@claude` decides an issue is too large, it can decompose it into child issues (each with `Parent: #N` in the body) and post `STATUS: DECOMPOSED`. The children run the pipeline independently.
+
+### Handoff protocol
+
+Agents communicate via issue comments using two conventions:
+- **`STATUS: TOKEN`** — signals the current state (e.g., `STATUS: PLAN_COMPLETE`, `STATUS: IMPLEMENTATION_COMPLETE`, `STATUS: APPROVED`)
+- **`@agent`** — routes to the next agent (e.g., `@codex please review`, `@implementer please implement`)
+
+Both must appear in the same comment. The `STATUS:` line can go anywhere; the `@mention` must be on the last non-empty line.
+
+### Watch progress
+
+- **Telegram**: `/status` shows active runs, queue depth, and breaker state
+- **HTTP**: `GET /status` returns the same info as JSON
+- **tmux**: `tmux attach -t agent-flow` to watch agent sessions live
+
 ## Docs
 
 - Developer spec and architecture: `SPEC.md`
