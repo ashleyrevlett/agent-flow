@@ -39,8 +39,7 @@ GitHub Webhook (issues, comments, PRs, CI)
 |---|---|---|
 | `issues.opened` | New issue created | → @claude (planner) |
 | `issue_comment.created` | Comment with @mention | → mentioned agent |
-| `pull_request.opened` | PR opened | → ignore (handoff comes via @mention in comment) |
-| `pull_request_review_comment.created` | PR comment with @mention | → mentioned agent |
+| `pull_request.opened` | PR opened | → ignore (handoff comes via issue comment) |
 | `workflow_run.completed` | CI finished | → log result |
 
 ## Lifecycle
@@ -54,7 +53,7 @@ Human creates issue (or via Telegram → gh issue create)
   → @implementer posts issue comment ending with "@codex please review PR #N"
   → webhook: issue_comment → dispatch @codex
   → @codex reviews PR
-      → approve: "@claude implementation approved" → merge
+      → approve: merge PR, post STATUS: APPROVED (no @mention — pipeline done)
       → request changes: "@implementer please address feedback" → cycle (max 3)
       → stuck: "@human please review"
   → merge to main → CI runs → issue auto-closes ("Closes #N" in PR)
@@ -110,7 +109,7 @@ FastAPI app with `POST /webhook` endpoint.
 - Parse `X-GitHub-Event` header for event type
 - Extract `action` from payload
 - **Handoff parsing (strict)**: only extract @mentions from the **last non-empty line** of a comment body, and only if the comment contains the `<!-- agent:NAME -->` tag. This prevents misfires from quoted text, code blocks, or casual @mentions mid-comment. Regex: scan the final line for `@(claude|implementer|codex|human)\b`.
-- For human-authored comments (no `<!-- agent:NAME -->` tag): also only parse @mentions from the last line, to allow humans to trigger agents explicitly while ignoring incidental mentions in discussion.
+- For human-authored comments (no `<!-- agent:NAME -->` tag): also only parse @mentions from the last line, **but only if the comment author is a repo collaborator** (`payload["comment"]["author_association"]` is `OWNER`, `MEMBER`, or `COLLABORATOR`). Ignore comments from external users entirely. This prevents unauthorized agent invocation on public repos.
 - Ignore @mentions inside markdown code blocks (`` ` `` or ``` ``` ```) and blockquotes (`>`).
 - Deduplication via `X-GitHub-Delivery` header checked against `state.db`
 - Dispatch in `BackgroundTasks` so webhook returns 200 immediately
@@ -263,14 +262,12 @@ Same structure but:
 [review summary — what's good, what needs changes]
 ---
 STATUS: APPROVED | CHANGES_REQUESTED | BLOCKED
-@claude implementation approved.
-  OR
 @implementer please address the feedback above.
   OR
 @human please review — [reason].
 ```
 
-**Approval action**: when approving, the reviewer runs `gh pr review {pr_number} --approve` AND `gh pr merge {pr_number} --squash --delete-branch`. The reviewer is responsible for merging approved PRs.
+**Approval action**: when approving, the reviewer runs `gh pr review {pr_number} --approve` AND `gh pr merge {pr_number} --squash --delete-branch`. The reviewer is responsible for merging approved PRs. On approval, the handoff comment ends with **no @mention** — the pipeline is complete. The `STATUS: APPROVED` comment is posted for record-keeping only, no further agent is spawned.
 
 **Failure rules:**
 - If the PR diff is empty or the branch is missing: post `STATUS: BLOCKED`, end with `@human`
