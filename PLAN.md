@@ -22,7 +22,7 @@ GitHub Webhook (issues, comments, PRs, CI)
       │
    monitor.py — periodic tmux pane health checks
       │
-   state.db — durable pipeline state (runs, dedup, cycles)
+   state.db — durable pipeline state (runs, dedup, cycles, decompositions)
 ```
 
 ## Agents
@@ -40,6 +40,7 @@ GitHub Webhook (issues, comments, PRs, CI)
 | `issues.opened` | New issue created | → @claude (planner) |
 | `issue_comment.created` | Comment with @mention | → mentioned agent |
 | `pull_request.opened` | PR opened | → ignore (handoff comes via issue comment) |
+| `issues.closed` | Issue closed | → `state.satisfy_dependency()` — unblocks dependent issues, triggers queue drain |
 | `workflow_run.completed` | CI finished | → log result |
 
 ## Lifecycle
@@ -47,8 +48,16 @@ GitHub Webhook (issues, comments, PRs, CI)
 ```
 Human creates issue (or via Telegram → gh issue create)
   → webhook: issues.opened → dispatch @claude
-  → @claude posts plan as issue comment, ends with "@implementer please implement"
-  → webhook: issue_comment → dispatch @implementer
+  → @claude planner chooses one of two modes:
+      Mode A (direct):
+        - post STATUS: PLAN_COMPLETE
+        - end with "@implementer please implement the tasks above"
+        - webhook: issue_comment → dispatch @implementer
+      Mode B (decompose):
+        - create child issues with explicit sequence/dependencies and parent link
+        - post STATUS: DECOMPOSED on parent (no implementer handoff yet)
+        - when ready, @claude posts handoff on the next child issue:
+          "@implementer please implement issue #X"
   → @implementer creates branch, writes code, opens PR
   → @implementer posts issue comment ending with "@codex please review PR #N"
   → webhook: issue_comment → dispatch @codex
@@ -60,6 +69,7 @@ Human creates issue (or via Telegram → gh issue create)
 ```
 
 Max 3 review cycles before escalating to @human.
+Decomposition depth is capped (default: 1 level of child issues) to prevent recursive planning loops.
 
 ## Project Structure
 
@@ -72,7 +82,7 @@ agent-flow/
 ├── spawn.py             # tmux session/window management, send-keys, capture-pane
 ├── monitor.py           # Periodic pane health checks, stuck detection, Telegram alerts
 ├── telegram.py          # Bot for @human escalation + issue creation
-├── state.py             # SQLite pipeline state — runs, dedup, cycle tracking
+├── state.py             # SQLite pipeline state — runs, dedup, cycle, decomposition tracking
 ├── roles/
 │   ├── planner.md       # System prompt for @claude (injected via --append-system-prompt-file)
 │   ├── implementer.md   # System prompt for @implementer (injected via --append-system-prompt-file)
@@ -100,6 +110,7 @@ Environment variables:
 - `MONITOR_POLL_SECONDS` — default 30
 - `IDLE_TIMEOUT_SECONDS` — default 300
 - `MAX_REVIEW_CYCLES` — default 3
+- `MAX_DECOMPOSITION_DEPTH` — default 1
 - `SQLITE_DB_PATH` — path to state DB
 - `BOT_GITHUB_USERNAME` — to filter self-triggered webhooks
 
@@ -130,7 +141,8 @@ CREATE TABLE runs (
     repo TEXT NOT NULL,
     agent TEXT NOT NULL,           -- claude, implementer, codex
     tmux_window TEXT,              -- window name for monitoring
-    status TEXT NOT NULL,          -- active, completed, failed, stuck
+    status TEXT NOT NULL,          -- queued, active, completed, failed, stuck
+    prompt_file TEXT,              -- path to task prompt file (needed to spawn from queue)
     started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     completed_at TIMESTAMP
 );
@@ -149,17 +161,57 @@ CREATE TABLE deliveries (
     delivery_id TEXT PRIMARY KEY,
     received_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+-- Planner decomposition tracking
+CREATE TABLE decompositions (
+    parent_issue_number INTEGER NOT NULL,
+    child_issue_number INTEGER NOT NULL,
+    repo TEXT NOT NULL,
+    sequence_index INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'planned', -- planned, in_progress, completed, blocked
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (repo, child_issue_number)
+);
+
+-- Issue dependency tracking (planner sets these when decomposing)
+CREATE TABLE dependencies (
+    issue_number INTEGER NOT NULL,
+    depends_on_issue INTEGER NOT NULL,
+    repo TEXT NOT NULL,
+    satisfied BOOLEAN NOT NULL DEFAULT FALSE,  -- set TRUE when depends_on_issue closes
+    PRIMARY KEY (repo, issue_number, depends_on_issue)
+);
+
+CREATE TABLE decomposition_meta (
+    parent_issue_number INTEGER NOT NULL,
+    repo TEXT NOT NULL,
+    depth INTEGER NOT NULL DEFAULT 0,
+    decomposition_done BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (repo, parent_issue_number)
+);
 ```
 
 Functions:
-- `record_run(issue_number, repo, agent)` — insert new run with status "pending", returns `run_id` (autoincrement). Called **before** tmux window creation so run_id is available for window naming.
-- `update_run_window(run_id, tmux_window)` — set window name and status to "active" after successful spawn
-- `update_run(run_id, status)` — mark completed/failed/stuck
-- `get_active_runs()` — for monitor to reconnect after restart
+- `enqueue_run(issue_number, repo, agent, prompt_file)` — insert new run with status `queued`, returns `run_id`. Called before any spawn attempt.
+- `try_promote(agent)` — atomically: if no `active` run exists for this agent type, find the oldest `queued` run **whose issue has no unsatisfied dependencies** (`is_blocked() == False`), promote it to `active`, and return it. If an `active` run exists or all queued runs are blocked, return `None`. Uses `UPDATE ... WHERE` with subqueries to prevent races.
+- `update_run_window(run_id, tmux_window)` — set window name after successful spawn
+- `complete_run(run_id)` — mark `completed`, set `completed_at`, then call `try_promote(agent)` to auto-dequeue the next job
+- `fail_run(run_id, status)` — mark `failed` or `stuck`, then call `try_promote(agent)` to auto-dequeue
+- `get_active_runs()` — all runs with status `active`, for monitor to reconnect after restart
+- `get_queue_depth(agent=None)` — count of `queued` runs, optionally filtered by agent type (for /status command)
 - `is_duplicate(delivery_id)` — atomic `INSERT ... ON CONFLICT DO NOTHING`, returns `True` if 0 rows affected (already seen). No separate check step — single statement eliminates race window under concurrent webhook handling.
 - `increment_cycle(issue_number, repo)` — bump count, return new count
 - `get_cycle_count(issue_number, repo)` — current count
 - `prune_deliveries(max_age_hours=24)` — cleanup old dedup entries. Default 24h is conservative; GitHub can redeliver webhooks for up to several hours after initial failure. Configurable via `DEDUP_TTL_HOURS` env var.
+- `record_dependency(issue_number, depends_on_issue, repo)` — store dependency link
+- `satisfy_dependency(closed_issue, repo)` — mark all dependencies on `closed_issue` as satisfied. Called when an issue closes (via webhook or PR merge). After satisfying, check if any queued runs for newly-unblocked issues can be promoted.
+- `is_blocked(issue_number, repo)` — returns `True` if any unsatisfied dependencies exist for this issue
+- `record_decomposition(parent_issue, child_issue, repo, sequence_index)` — store child issue mapping
+- `mark_decomposition_done(parent_issue, repo)` — idempotency flag to prevent duplicate child creation on retries
+- `is_decomposition_done(parent_issue, repo)` — check if parent already decomposed
+- `list_children(parent_issue, repo)` — ordered child issues for sequencing
 
 ### 4. dispatch.py
 
@@ -167,16 +219,36 @@ Core routing function `handle_event(event_type, action, payload)`:
 
 1. Check `state.is_duplicate(delivery_id)` — skip if seen
 2. Determine target agent from event type + @mention
-3. Fetch full context via `gh` CLI:
+3. For reviewer handoffs: check `state.get_cycle_count()` — if >= MAX_REVIEW_CYCLES, route to @human instead
+4. For reviewer → implementer handoffs: `state.increment_cycle()`
+5. Fetch full context via `gh` CLI:
    - Issue thread: `gh api repos/{owner}/{repo}/issues/{number}/comments`
    - PR diff: `gh pr diff {number}`
    - Issue body: from payload
-4. For reviewer handoffs: check `state.get_cycle_count()` — if >= MAX_REVIEW_CYCLES, route to @human instead
-5. **Pre-create run row**: `run_id = state.record_run(issue_number, repo, agent)` — returns the auto-incremented id before tmux window exists
-6. Call appropriate prompt builder → writes prompt file to `/tmp/agent-flow/prompts/{agent}-{issue_id}.md`
-7. Call `spawn.create_agent_window(run_id, agent_name, issue_id, ...)` — uses run_id in window name
-8. Update run with tmux window name: `state.update_run_window(run_id, tmux_window)`
-9. For reviewer → implementer handoffs: `state.increment_cycle()`
+6. Call appropriate prompt builder → writes prompt file to `/tmp/agent-flow/prompts/{agent}-{issue_id}-{timestamp}.md`
+7. **Enqueue**: `run_id = state.enqueue_run(issue_number, repo, agent, prompt_file)`
+8. **Try to promote**: `run = state.try_promote(agent)` — if another run of this agent type is already active, returns `None` and the job stays queued
+9. If promoted: call `spawn.create_agent_window(run.id, agent_name, issue_id, ...)`, then `state.update_run_window(run.id, tmux_window)`
+10. If not promoted: job waits in queue. It will be auto-spawned when the current active run of this agent type completes (via `complete_run` or `fail_run`).
+
+**Queue drain function** `drain_queue(agent)`:
+Called by `state.complete_run()` and `state.fail_run()` after marking a run done. Also called by monitor on startup to resume any orphaned queued runs.
+1. `run = state.try_promote(agent)`
+2. If `run`: spawn tmux window, update run with window name
+3. If not: no queued work for this agent type, nothing to do
+
+**Dependency parsing** (on `issues.opened`):
+- Parse issue body for `Depends-on: #X` lines (regex: `Depends-on:\s*#(\d+)`)
+- For each dependency found: `state.record_dependency(issue_number, depends_on_issue, repo)`
+- The run will be enqueued normally but `try_promote` will skip it until all dependencies are satisfied
+
+**Dependency satisfaction** (on `issues.closed`):
+- Call `state.satisfy_dependency(closed_issue, repo)` — marks all dependencies on this issue as satisfied
+- Then drain the queue for all agent types — newly unblocked issues may now be promotable
+
+**Planner gating** (handled after planner run completes, not during dispatch):
+- If planner emits `STATUS: DECOMPOSED`, dispatcher records decomposition state. Child issues created by the planner trigger `issues.opened` webhooks, which enter the queue normally.
+- Decomposition is idempotent: if `state.is_decomposition_done(parent_issue, repo)` is true, skip creating duplicate children.
 
 ### 5. spawn.py
 
@@ -205,8 +277,12 @@ Functions:
 
 Contains the persistent role identity and protocol rules for @claude:
 - Role: "You are the PLANNER. Analyze issues and create detailed implementation plans."
-- Output contract template (STATUS: PLAN_COMPLETE format)
-- Handoff rule: end comment with `@implementer please implement the tasks above`
+- Dual-mode output contracts:
+  - `STATUS: PLAN_COMPLETE` for direct implementation
+  - `STATUS: DECOMPOSED` when parent issue is split into child issues
+- Handoff rule:
+  - Direct mode: end comment with `@implementer please implement the tasks above`
+  - Decompose mode: no implementer handoff on parent; handoff happens on chosen child issue
 - Comment format: must start with `<!-- agent:claude -->`
 - Exact `gh` command template for posting
 - Failure escalation rules (blocked, failed → @human)
@@ -227,8 +303,35 @@ STATUS: PLAN_COMPLETE
 @implementer please implement the tasks above.
 ```
 
+**Decomposition contract** — when issue is too vague or too large:
+```
+<!-- agent:claude -->
+## Decomposition for: {issue_title}
+[why decomposition is needed]
+
+Created child issues:
+- #{child_1} — [title] (sequence 1/N)
+- #{child_2} — [title] (sequence 2/N)
+...
+---
+STATUS: DECOMPOSED
+```
+
+Decompose when any of the following are true:
+- acceptance criteria are missing or ambiguous
+- estimated work is larger than one focused coding session
+- multiple independent workstreams require ordering
+- cross-cutting architectural decisions must be sequenced
+
+Child issue requirements:
+- include `Parent: #{parent_issue_number}` in issue body
+- include `Sequence: {k}/{N}` in issue body
+- include `Depends-on: #X` in issue body where needed — the dispatcher parses this from the issue body on `issues.opened` and records it in `state.dependencies`. The dependent issue will stay queued until all `Depends-on` issues are closed.
+- keep decomposition depth within `MAX_DECOMPOSITION_DEPTH`
+
 **Failure rules** — included in every prompt:
 - If the issue lacks enough context to plan: post a comment asking for clarification, end with `@human please provide more detail`
+- If issue should be decomposed: create child issues, post `STATUS: DECOMPOSED` on parent, and do not hand off to implementer on parent
 - If you encounter a permissions error or cannot access the repo: post `STATUS: BLOCKED` with the error, end with `@human`
 - If `gh` CLI fails: retry once, then post `STATUS: FAILED` with the error, end with `@human`
 - Never silently exit. Always post a GitHub comment with a STATUS line.
@@ -300,7 +403,9 @@ Every `MONITOR_POLL_SECONDS`:
 
 For Claude Code (alt-screen buffer): also poll GitHub for new comments tagged with `<!-- agent:X -->` as primary completion signal.
 
-On startup: check `state.get_active_runs()` against actual tmux windows. Mark orphaned runs as failed.
+On startup: check `state.get_active_runs()` against actual tmux windows. Mark orphaned runs as failed via `state.fail_run()` (which auto-drains the queue for that agent type).
+
+On run completion detected (agent posted to GitHub / pane exited): call `state.complete_run(run_id)` which auto-promotes the next queued job.
 
 ### 13. telegram.py
 
@@ -308,7 +413,7 @@ Using `python-telegram-bot`:
 - `send_notification(message, issue_url)` — on @human mention
 - `send_stuck_alert(agent, window, excerpt)` — from monitor
 - `/create_issue <title>` command — human creates issue via Telegram
-- `/status` command — show active agent windows (from state.db)
+- `/status` command — show active agent windows + queue depth per agent type + blocked issues (from state.db)
 - `/kill <window>` command — kill stuck agent, mark run as failed
 
 ### 14. CLAUDE.md / AGENTS.md for target repos (optional)
@@ -373,6 +478,11 @@ System: `tmux`, `gh` CLI, `claude` CLI, `codex` CLI, `ngrok` (dev)
 6. **Dedup**: Send same webhook twice, verify only one agent spawns
 7. **Restart recovery**: Kill main.py, restart, verify monitor reconnects to active tmux windows
 8. **Completion**: Verify merge → CI → issue closes
+9. **Decomposition mode**: Create oversized/vague issue, verify planner creates child issues, posts `STATUS: DECOMPOSED`, and does not trigger implementer on parent
+10. **Decomposition idempotency**: Redeliver same decomposition-triggering webhook, verify no duplicate child issues are created
+11. **Concurrency limit**: Create two issues simultaneously, verify only one @claude runs at a time, second is queued
+12. **Queue drain**: When active run completes, verify next queued run auto-promotes and spawns
+13. **Dependency blocking**: Create issue with `Depends-on: #X` where #X is open, verify it stays queued. Close #X, verify dependent issue promotes.
 
 ## Risks
 
@@ -385,5 +495,7 @@ System: `tmux`, `gh` CLI, `claude` CLI, `codex` CLI, `ngrok` (dev)
 | Agents hang on permission prompts | Use `--dangerously-skip-permissions` |
 | tmux session disappears | Monitor checks session existence, recreates if needed |
 | Review cycle loops | Hard max of 3 cycles, then @human escalation (persisted in state.db) |
-| Concurrent agents on same repo | Each agent works on a separate branch per issue |
+| Recursive decomposition loops | Enforce `MAX_DECOMPOSITION_DEPTH` and idempotent `decomposition_done` flag per parent issue |
+| Concurrent agents on same repo | Max 1 active run per agent type; queue serializes work. Each issue gets its own branch. |
+| Queue starvation from blocked deps | Monitor reports blocked issues in /status; dependencies only block specific issues, not the whole queue |
 | Restart loses track of active agents | state.db persists runs; monitor reconciles against tmux on startup |
