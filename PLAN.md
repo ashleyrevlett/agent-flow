@@ -73,10 +73,14 @@ agent-flow/
 ├── monitor.py           # Periodic pane health checks, stuck detection, Telegram alerts
 ├── telegram.py          # Bot for @human escalation + issue creation
 ├── state.py             # SQLite pipeline state — runs, dedup, cycle tracking
+├── roles/
+│   ├── planner.md       # System prompt for @claude (injected via --append-system-prompt-file)
+│   ├── implementer.md   # System prompt for @implementer (injected via --append-system-prompt-file)
+│   └── reviewer.md      # System prompt for @codex (injected via -c model_instructions_file=)
 ├── prompts/
-│   ├── planner.py       # Builds prompt file for @claude
-│   ├── implementer.py   # Builds prompt file for @implementer
-│   └── reviewer.py      # Builds prompt file for @codex
+│   ├── planner.py       # Builds task-specific prompt file for @claude
+│   ├── implementer.py   # Builds task-specific prompt file for @implementer
+│   └── reviewer.py      # Builds task-specific prompt file for @codex
 ├── requirements.txt
 └── .env.example
 ```
@@ -183,24 +187,35 @@ Functions:
 - `create_agent_window(run_id, agent_name, issue_id, cli_command, prompt_file_path, repo_path)`:
   1. Create named window: `tmux new-window -t SESSION -n "{agent}-{issue_id}-{run_id}"` (run_id from state.db ensures uniqueness across retries)
   2. Send `cd {repo_path}` via send-keys
-  3. Send CLI command via send-keys (e.g. `claude --dangerously-skip-permissions`)
+  3. Send CLI command via send-keys with role injection:
+     - @claude: `claude --dangerously-skip-permissions --append-system-prompt-file /path/to/agent-flow/roles/planner.md`
+     - @implementer: `claude --dangerously-skip-permissions --model sonnet --append-system-prompt-file /path/to/agent-flow/roles/implementer.md`
+     - @codex: `codex -c model_instructions_file=/path/to/agent-flow/roles/reviewer.md`
   4. Wait briefly for CLI to initialize
   5. Send single-line instruction: `"Read and execute the task in {prompt_file_path}"`
 - `capture_pane(window_name, lines=500)` — `tmux capture-pane -p -S -{lines}`
 - `kill_window(window_name)` — cleanup
 - `list_windows()` — for monitor
 
-**Prompt delivery**: Write full multi-line prompt to a file on disk. Send a single-line instruction via send-keys telling the agent to read that file. This avoids multi-line send-keys issues.
+**Two-layer prompt architecture**:
+- **Layer 1 — Role (system prompt)**: Injected via CLI flag at spawn time. Contains agent identity, protocol rules, output contracts, handoff format, failure escalation rules. Lives in `roles/*.md`. Persistent for the entire session. Does NOT change between tasks. The target repo's own CLAUDE.md / AGENTS.md is loaded automatically by the CLI and coexists with our role file — no conflict.
+- **Layer 2 — Task (user prompt)**: Written to a temp file per invocation. Contains issue context, comment thread, specific instructions. Delivered via send-keys ("Read and execute the task in {path}"). Changes every time an agent is spawned.
 
-### 6. prompts/planner.py
+### 6. roles/planner.md (static system prompt)
 
-Writes a prompt file containing:
+Contains the persistent role identity and protocol rules for @claude:
 - Role: "You are the PLANNER. Analyze issues and create detailed implementation plans."
-- Issue context: title, body, full comment thread
-- Instructions: post plan as GitHub comment via `gh issue comment`
+- Output contract template (STATUS: PLAN_COMPLETE format)
 - Handoff rule: end comment with `@implementer please implement the tasks above`
 - Comment format: must start with `<!-- agent:claude -->`
 - Exact `gh` command template for posting
+- Failure escalation rules (blocked, failed → @human)
+
+### 7. prompts/planner.py (dynamic task builder)
+
+Writes a per-invocation task file containing:
+- Issue context: title, body, full comment thread
+- Issue number and repo for `gh` commands
 
 **Output contract** — planner comment must follow this structure:
 ```
@@ -218,15 +233,22 @@ STATUS: PLAN_COMPLETE
 - If `gh` CLI fails: retry once, then post `STATUS: FAILED` with the error, end with `@human`
 - Never silently exit. Always post a GitHub comment with a STATUS line.
 
-### 7. prompts/implementer.py
+### 8. roles/implementer.md (static system prompt)
 
-Same structure but:
+Contains the persistent role identity and protocol rules for @implementer:
 - Role: "You are the IMPLEMENTER. Write code to fulfill the plan."
-- Includes plan text from planner's comment
-- Instructions: create feature branch, implement, commit, push, open PR with `Closes #{issue_number}`
-- Handoff: after opening PR, post a **separate issue comment** (not PR comment) with the handoff. This ensures the handoff triggers via `issue_comment` webhook only — no double-trigger from `pull_request.opened`.
-- Comment tag: `<!-- agent:implementer -->`
+- Output contract template (STATUS: IMPLEMENTATION_COMPLETE format)
+- Handoff: after opening PR, post a **separate issue comment** (not PR comment). This ensures the handoff triggers via `issue_comment` webhook only — no double-trigger from `pull_request.opened`.
 - **All handoff @mentions must be posted as issue comments via `gh issue comment`, never as PR comments.** This is critical for the webhook routing to work.
+- Comment tag: `<!-- agent:implementer -->`
+- Branch naming, commit format, PR body rules
+- Failure escalation rules (blocked, CI failing, tests failing → appropriate handler)
+
+### 9. prompts/implementer.py (dynamic task builder)
+
+Writes a per-invocation task file containing:
+- Plan text from planner's comment
+- Issue number, repo, and PR context for `gh` commands
 
 **Output contract** — implementer issue comment must follow this structure:
 ```
@@ -246,55 +268,26 @@ STATUS: IMPLEMENTATION_COMPLETE
 - If CI fails on the PR: post `STATUS: CI_FAILING` with relevant logs, end with `@codex please review`
 - Never silently exit. Always post a GitHub comment with a STATUS line.
 
-### 8. prompts/reviewer.py
+### 10. roles/reviewer.md (static system prompt)
 
-Same structure but:
+Contains the persistent role identity and protocol rules for @codex:
 - Role: "You are the REVIEWER. Review PRs for correctness, quality, and completeness."
-- Includes PR diff and description
+- Output contract templates (APPROVED / CHANGES_REQUESTED / BLOCKED formats)
 - Instructions: post review via `gh pr review`, then post handoff as **issue comment** via `gh issue comment`
 - **All handoff @mentions must be posted as issue comments via `gh issue comment`, never as PR comments.** This is critical for the webhook routing to work.
 - Comment tag: `<!-- agent:codex -->`
+- Approval action: reviewer merges via `gh pr merge --squash --delete-branch`
+- Failure escalation rules
 
-**Output contract** — reviewer issue comment must follow one of these templates:
+### 11. prompts/reviewer.py (dynamic task builder)
 
-Approved (no @mention — pipeline ends):
-```
-<!-- agent:codex -->
-## Review of PR #{pr_number}
-[review summary — what's good]
----
-STATUS: APPROVED
-```
+Writes a per-invocation task file containing:
+- PR diff and description
+- Issue number, PR number, repo for `gh` commands
 
-Changes requested:
-```
-<!-- agent:codex -->
-## Review of PR #{pr_number}
-[review summary — what needs fixing]
----
-STATUS: CHANGES_REQUESTED
-@implementer please address the feedback above.
-```
+Note: output contract templates, approval action, and failure rules for the reviewer are defined in `roles/reviewer.md` (see section 10 above).
 
-Blocked:
-```
-<!-- agent:codex -->
-## Review of PR #{pr_number}
-[what's blocking]
----
-STATUS: BLOCKED
-@human please review — [reason].
-```
-
-**Approval action**: when approving, the reviewer runs `gh pr review {pr_number} --approve` AND `gh pr merge {pr_number} --squash --delete-branch`. The reviewer is responsible for merging approved PRs. On approval, the handoff comment ends with **no @mention** — the pipeline is complete. The `STATUS: APPROVED` comment is posted for record-keeping only, no further agent is spawned.
-
-**Failure rules:**
-- If the PR diff is empty or the branch is missing: post `STATUS: BLOCKED`, end with `@human`
-- If you cannot determine correctness (e.g. no tests, unclear requirements): post `STATUS: BLOCKED` with what's missing, end with `@human please review`
-- If `gh pr review` or `gh pr merge` fails: retry once, then post `STATUS: FAILED` with error, end with `@human`
-- Never silently exit. Always post a GitHub comment with a STATUS line.
-
-### 9. monitor.py
+### 12. monitor.py
 
 Async loop running alongside FastAPI.
 
@@ -309,7 +302,7 @@ For Claude Code (alt-screen buffer): also poll GitHub for new comments tagged wi
 
 On startup: check `state.get_active_runs()` against actual tmux windows. Mark orphaned runs as failed.
 
-### 10. telegram.py
+### 13. telegram.py
 
 Using `python-telegram-bot`:
 - `send_notification(message, issue_url)` — on @human mention
@@ -318,20 +311,13 @@ Using `python-telegram-bot`:
 - `/status` command — show active agent windows (from state.db)
 - `/kill <window>` command — kill stuck agent, mark run as failed
 
-### 11. CLAUDE.md for target repo
+### 14. CLAUDE.md / AGENTS.md for target repos (optional)
 
-Placed in the repo agents work on. Instructs Claude Code on the pipeline protocol:
-- **All handoff comments must be issue comments** (`gh issue comment`), never PR comments. The webhook routing depends on this.
-- PR reviews go through `gh pr review` (approve/request-changes), but the handoff @mention is always a separate issue comment.
-- Always tag comments with `<!-- agent:ROLE -->`
-- Always end with exactly one @mention handoff on the last line, **except** when posting `STATUS: APPROVED` — approval means the pipeline is complete, no further agent is needed
-- Always include a `STATUS:` line before the handoff (PLAN_COMPLETE, IMPLEMENTATION_COMPLETE, APPROVED, CHANGES_REQUESTED, BLOCKED, FAILED)
-- Never silently exit — always post a status comment even on failure
-- Branch naming: `feature/{issue_number}-{short_desc}`
-- Commit format: conventional commits referencing issue
-- PR body: include `Closes #{issue_number}`
+Target repos may have their own CLAUDE.md or AGENTS.md with project-specific conventions (code style, test frameworks, etc.). These are loaded automatically by Claude Code / Codex CLI and coexist with our injected role files. No conflict — our role files add pipeline protocol, the repo's files add project conventions.
 
-### 12. main.py
+If a target repo wants to add pipeline-aware instructions, it can include these in its own CLAUDE.md / AGENTS.md, but this is optional — the role files in `roles/` are the authoritative source for pipeline protocol.
+
+### 15. main.py
 
 Entry point:
 - Create tmux session
@@ -362,7 +348,8 @@ System: `tmux`, `gh` CLI, `claude` CLI, `codex` CLI, `ngrok` (dev)
 - `spawn.py` — tmux management, send-keys, capture-pane
 
 ### Phase 2 — Core Pipeline
-- `prompts/planner.py`, `implementer.py`, `reviewer.py`
+- `roles/planner.md`, `roles/implementer.md`, `roles/reviewer.md` — static system prompts
+- `prompts/planner.py`, `implementer.py`, `reviewer.py` — dynamic task builders
 - `dispatch.py` — routing, context fetching, prompt assembly, state tracking
 - `webhook.py` — FastAPI endpoint, signature verification, dedup via state.db
 
