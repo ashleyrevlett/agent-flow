@@ -382,19 +382,23 @@ class GitLabProvider:
     # path inside the agent-flow project), then pass the file to the CLI.
     # This avoids shell quoting issues and works regardless of the agent's cwd.
 
-    def comment_cli(self, issue_number: int, repo: str) -> str:
+    @staticmethod
+    def _tmp_file(repo: str, issue_number: int, kind: str) -> str:
         from config import TMP_DIR
+        repo_slug = repo.replace("/", "-")
+        return f"{TMP_DIR}/{kind}-{repo_slug}-{issue_number}.md"
+
+    def comment_cli(self, issue_number: int, repo: str) -> str:
         p = self._host_prefix()
-        f = f"{TMP_DIR}/comment-{issue_number}.md"
+        f = self._tmp_file(repo, issue_number, "comment")
         return (
             f"Write your comment body to {f}, then run:\n"
             f"`{p}glab issue note {issue_number} --repo {repo} -m \"$(cat {f})\"`"
         )
 
     def mr_create_cli(self, issue_number: int, repo: str) -> str:
-        from config import TMP_DIR
         p = self._host_prefix()
-        f = f"{TMP_DIR}/pr-body-{issue_number}.md"
+        f = self._tmp_file(repo, issue_number, "mr-body")
         return (
             f"Write your MR description to {f}, then run:\n"
             f"`{p}glab mr create --repo {repo} --description \"$(cat {f})\" --title \"<title>\"`"

@@ -260,19 +260,23 @@ class GitHubProvider:
         host = self._base_url.replace("https://", "").replace("http://", "").rstrip("/")
         return f"GH_HOST={host} "
 
-    def comment_cli(self, issue_number: int, repo: str) -> str:
+    @staticmethod
+    def _tmp_file(repo: str, issue_number: int, kind: str) -> str:
         from config import TMP_DIR
+        repo_slug = repo.replace("/", "-")
+        return f"{TMP_DIR}/{kind}-{repo_slug}-{issue_number}.md"
+
+    def comment_cli(self, issue_number: int, repo: str) -> str:
         p = self._gh_prefix()
-        f = f"{TMP_DIR}/comment-{issue_number}.md"
+        f = self._tmp_file(repo, issue_number, "comment")
         return (
             f"Write your comment body to {f}, then run:\n"
             f"`{p}gh issue comment {issue_number} --repo {repo} --body-file {f}`"
         )
 
     def mr_create_cli(self, issue_number: int, repo: str) -> str:
-        from config import TMP_DIR
         p = self._gh_prefix()
-        f = f"{TMP_DIR}/pr-body-{issue_number}.md"
+        f = self._tmp_file(repo, issue_number, "pr-body")
         return (
             f"Write your PR description to {f}, then run:\n"
             f"`{p}gh pr create --repo {repo} --body-file {f} --title \"<title>\"`"
