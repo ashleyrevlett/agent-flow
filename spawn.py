@@ -118,6 +118,38 @@ def _send_keys(window: str, keys: str, enter: bool = True):
     _tmux(cmd)
 
 
+def _handle_trust_prompt(window_name: str, timeout: int = 15, poll_interval: float = 1.0):
+    """Wait for Claude Code to initialize. If it shows a trust prompt, send 'y'.
+
+    Claude Code with --dangerously-skip-permissions asks the user to confirm
+    trusting the directory on first use. This polls the pane content and
+    sends 'y' when detected, then waits for the CLI to be ready for input.
+    """
+    import re
+    trust_pattern = re.compile(r"trust|Do you want to|y/n|Yes.*No", re.IGNORECASE)
+    elapsed = 0.0
+
+    while elapsed < timeout:
+        time.sleep(poll_interval)
+        elapsed += poll_interval
+        content = capture_pane(window_name, lines=30)
+
+        if trust_pattern.search(content):
+            logger.info("Trust prompt detected in %s — sending 'y'", window_name)
+            _send_keys(window_name, "y")
+            # Wait for CLI to finish initializing after trust confirmation
+            time.sleep(3)
+            return
+
+        # If we see the input prompt (> or $) without a trust prompt, CLI is ready
+        lines = [l.strip() for l in content.splitlines() if l.strip()]
+        if lines and (lines[-1].startswith(">") or lines[-1].endswith("$")):
+            return
+
+    # Timeout — proceed anyway, CLI may have initialized without a trust prompt
+    logger.warning("Trust prompt not detected in %s after %ds — proceeding", window_name, timeout)
+
+
 def create_agent_window(
     run_id: int,
     agent_name: str,
@@ -142,8 +174,13 @@ def create_agent_window(
     cli_cmd = _build_cli_command(agent_name, issue_id, run_id)
     _send_keys(window_name, cli_cmd)
 
-    # Wait for CLI to initialize
-    time.sleep(2)
+    # Claude Code with --dangerously-skip-permissions prompts the user to
+    # trust the directory on first launch. Poll the pane and send 'y' if
+    # the trust prompt appears, then wait for the CLI to fully initialize.
+    if agent_name in ("claude", "implementer"):
+        _handle_trust_prompt(window_name)
+    else:
+        time.sleep(2)
 
     # Send single-line task instruction
     instruction = f"Read and execute the task in {prompt_file_path}"
