@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+"""Clean up orphaned resources: prompt files, worktrees, dead tmux windows.
+
+Usage:
+    scripts/cleanup              # dry run — show what would be removed
+    scripts/cleanup --force      # actually remove
+"""
+
+import os
+import shutil
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from dotenv import load_dotenv
+load_dotenv()
+
+from pathlib import Path
+from config import PROMPT_DIR, WORKTREE_DIR
+
+dry_run = "--force" not in sys.argv
+
+
+def main():
+    if dry_run:
+        print("DRY RUN — pass --force to actually delete\n")
+
+    cleaned = 0
+
+    # 1. Prompt files
+    print("PROMPT FILES")
+    print("-" * 50)
+    prompt_dir = Path(PROMPT_DIR)
+    if prompt_dir.exists():
+        files = sorted(prompt_dir.glob("*.md"))
+        if files:
+            for f in files:
+                print(f"  {f.name}")
+                if not dry_run:
+                    f.unlink()
+                cleaned += 1
+        else:
+            print("  (none)")
+    else:
+        print("  (directory does not exist)")
+
+    # 2. Agent-flow tmp files
+    print()
+    print("TMP FILES")
+    print("-" * 50)
+    tmp_dir = Path(__file__).parent.parent / "tmp"
+    if tmp_dir.exists():
+        files = sorted(tmp_dir.iterdir())
+        if files:
+            for f in files:
+                print(f"  {f.name}")
+                if not dry_run:
+                    if f.is_dir():
+                        shutil.rmtree(f)
+                    else:
+                        f.unlink()
+                cleaned += 1
+        else:
+            print("  (none)")
+    else:
+        print("  (directory does not exist)")
+
+    # 3. Reviewer worktrees
+    print()
+    print("REVIEWER WORKTREES")
+    print("-" * 50)
+    wt_dir = Path(WORKTREE_DIR)
+    if wt_dir.exists():
+        dirs = sorted(wt_dir.iterdir())
+        if dirs:
+            for d in dirs:
+                print(f"  {d.name}")
+                if not dry_run:
+                    shutil.rmtree(d, ignore_errors=True)
+                cleaned += 1
+        else:
+            print("  (none)")
+    else:
+        print("  (directory does not exist)")
+
+    # 4. Claude Code worktrees
+    print()
+    print("CLAUDE CODE WORKTREES")
+    print("-" * 50)
+    for base_name in (".claude", ".claude-code"):
+        cc_wt = Path.home() / base_name / "worktrees"
+        if cc_wt.exists():
+            dirs = sorted(cc_wt.iterdir())
+            agent_dirs = [d for d in dirs if d.name.startswith(("plan-", "feature-"))]
+            if agent_dirs:
+                for d in agent_dirs:
+                    print(f"  ~/{base_name}/worktrees/{d.name}")
+                    if not dry_run:
+                        shutil.rmtree(d, ignore_errors=True)
+                    cleaned += 1
+
+    if not any((Path.home() / b / "worktrees").exists() for b in (".claude", ".claude-code")):
+        print("  (no worktree directories found)")
+
+    # 5. Dead tmux windows (hermes- or agent windows with no matching active run)
+    print()
+    print("TMUX WINDOWS")
+    print("-" * 50)
+    try:
+        import hermes_spawn
+        import state
+        state.init_db()
+        windows = hermes_spawn.list_windows()
+        active_runs = state.get_active_runs()
+        active_windows = {r["tmux_window"] for r in active_runs if r["tmux_window"]}
+
+        orphan_windows = [w for w in windows if w not in active_windows and w != "bash"]
+        if orphan_windows:
+            for w in orphan_windows:
+                print(f"  {w} (orphaned)")
+                if not dry_run:
+                    hermes_spawn.kill_window(w)
+                cleaned += 1
+        else:
+            print("  (no orphans)")
+    except FileNotFoundError:
+        print("  (tmux not available)")
+
+    print()
+    if dry_run:
+        print(f"Found {cleaned} items to clean. Run with --force to delete.")
+    else:
+        print(f"Cleaned {cleaned} items.")
+
+
+if __name__ == "__main__":
+    main()

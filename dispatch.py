@@ -4,6 +4,7 @@ builds prompts, enqueues and spawns agents.
 """
 
 import logging
+import os
 import re
 from typing import Optional
 
@@ -384,6 +385,12 @@ def _spawn_run(run):
             )
         except Exception:
             logger.exception("Failed to create reviewer worktree for run %d", run_id)
+            # Clean up partial worktree if directory was created before the error
+            from config import WORKTREE_DIR
+            for prefix in ("review", "planreview"):
+                partial = os.path.join(WORKTREE_DIR, f"{prefix}-{issue_id}-{run_id}")
+                if os.path.exists(partial):
+                    spawn.cleanup_worktree(partial, repo_path=REPO_LOCAL_PATH)
             state.fail_run(run_id)
             return
         state.update_run_worktree(run_id, worktree_path)

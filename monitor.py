@@ -66,6 +66,7 @@ async def _startup_recovery():
             logger.warning("Orphaned run %d (window %s gone) — marking failed", run_id, window)
             state.fail_run(run_id)
             _cleanup_run_worktree(run)
+            _cleanup_run_artifacts(run)
 
     # Drain queues — pick up any work that was queued before restart
     for agent in ("claude", "implementer", "codex"):
@@ -97,6 +98,7 @@ async def _poll():
             )
             state.fail_run(run_id, new_status="failed")
             _cleanup_run_worktree(run)
+            _cleanup_run_artifacts(run)
             continue
 
         # --- Circuit breaker expiry ---
@@ -142,6 +144,19 @@ def _handle_completion(run, status_token: Optional[str]):
         state.complete_run(run_id)
 
     _cleanup_run_worktree(run)
+    _cleanup_run_artifacts(run)
+
+
+def _cleanup_run_artifacts(run):
+    """Clean up prompt files and Claude Code worktrees after a run ends."""
+    prompt_file = run["prompt_file"]
+    if prompt_file:
+        hermes_spawn._cleanup_prompt_file(prompt_file)
+
+    agent = run["agent"]
+    issue_id = str(run["issue_number"])
+    run_id = run["id"]
+    hermes_spawn._cleanup_claude_worktrees(agent, issue_id, run_id)
 
 
 def _sqlite_ts_to_iso(ts: str) -> str:

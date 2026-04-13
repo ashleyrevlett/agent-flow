@@ -153,6 +153,51 @@ Do NOT interfere with the CLI's work. Just watch and wait.
 
 
 # ---------------------------------------------------------------------------
+# Cleanup helpers
+# ---------------------------------------------------------------------------
+
+def _cleanup_claude_worktrees(agent_name: str, issue_id: str, run_id: int):
+    """Remove Claude Code worktrees created via the -w flag.
+
+    Claude Code creates worktrees at ~/.claude/worktrees/{name}. These are
+    NOT managed by spawn.py (which handles reviewer worktrees). We need to
+    clean them up explicitly after the run finishes.
+    """
+    from pathlib import Path
+    home = Path.home()
+
+    # Claude Code worktree names match the -w flag values
+    worktree_names = []
+    if agent_name == "claude":
+        worktree_names.append(f"plan-{issue_id}-{run_id}")
+    elif agent_name == "implementer":
+        worktree_names.append(f"feature-{issue_id}-{run_id}")
+    # codex doesn't use -w flag
+
+    for name in worktree_names:
+        # Claude Code may store worktrees in different locations depending on version
+        for base in (home / ".claude" / "worktrees", home / ".claude-code" / "worktrees"):
+            wt = base / name
+            if wt.exists():
+                import shutil
+                try:
+                    shutil.rmtree(wt)
+                    logger.info("Cleaned up Claude Code worktree: %s", wt)
+                except OSError as exc:
+                    logger.warning("Failed to clean up Claude Code worktree %s: %s", wt, exc)
+
+
+def _cleanup_prompt_file(prompt_file_path: str):
+    """Remove the per-invocation prompt file after the run finishes."""
+    try:
+        if os.path.exists(prompt_file_path):
+            os.unlink(prompt_file_path)
+            logger.info("Cleaned up prompt file: %s", prompt_file_path)
+    except OSError as exc:
+        logger.warning("Failed to clean up prompt file %s: %s", prompt_file_path, exc)
+
+
+# ---------------------------------------------------------------------------
 # tmux helpers
 # ---------------------------------------------------------------------------
 
@@ -274,15 +319,25 @@ def create_agent_run(
 
             logger.info("Hermes window %s closed for run %d", hermes_window, run_id)
 
-            # Also clean up the CLI window if hermes left it behind
+            # Clean up the CLI window if hermes left it behind
             if _window_exists(cli_window):
                 kill_window(cli_window)
+
+            # Clean up Claude Code worktrees created via -w flag
+            _cleanup_claude_worktrees(agent_name, issue_id, run_id)
+
+            # Clean up the prompt file
+            _cleanup_prompt_file(prompt_file_path)
 
             import state
             state.complete_run(run_id)
 
         except Exception:
             logger.exception("Monitor thread crashed for run %d", run_id)
+            if _window_exists(cli_window):
+                kill_window(cli_window)
+            _cleanup_claude_worktrees(agent_name, issue_id, run_id)
+            _cleanup_prompt_file(prompt_file_path)
             import state
             state.fail_run(run_id)
         finally:
