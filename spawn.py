@@ -48,8 +48,15 @@ def create_reviewer_worktree(issue_id: str, run_id: int, pr_branch: str | None, 
     if pr_branch:
         name = f"review-{issue_id}-{run_id}"
         worktree_path = str(Path(WORKTREE_DIR) / name)
+        # Use --detach so we check out the commit at the tip of the branch
+        # without locking the branch ref. The branch may already be checked
+        # out in another worktree (e.g. Claude Code's own -w worktree).
         subprocess.run(
-            ["git", "-C", repo_path, "worktree", "add", worktree_path, pr_branch],
+            ["git", "-C", repo_path, "fetch", "origin", pr_branch],
+            check=False,  # fetch may fail if already up to date
+        )
+        subprocess.run(
+            ["git", "-C", repo_path, "worktree", "add", "--detach", worktree_path, pr_branch],
             check=True,
         )
     else:
