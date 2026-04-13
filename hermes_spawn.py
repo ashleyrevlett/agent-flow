@@ -18,7 +18,7 @@ import threading
 from pathlib import Path
 from typing import Optional
 
-from config import ROLES_DIR, TMP_DIR
+from config import ROLES_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -116,13 +116,11 @@ If it crashes or shows a fatal error, report "ERROR: <brief description>".
 _active_threads: dict[int, threading.Thread] = {}
 
 
-def _write_file(run_id: int, name: str, content: str) -> str:
-    """Write content to a temp file. Returns the path."""
-    os.makedirs(TMP_DIR, exist_ok=True)
-    path = os.path.join(TMP_DIR, f"hermes-{name}-{run_id}.md")
-    with open(path, "w") as f:
-        f.write(content)
-    return path
+def _hermes_env() -> dict[str, str]:
+    """Build env dict for hermes subprocess with the runner system prompt."""
+    env = dict(os.environ)
+    env["HERMES_EPHEMERAL_SYSTEM_PROMPT"] = _RUNNER_SYSTEM_PROMPT
+    return env
 
 
 def create_agent_run(
@@ -144,28 +142,28 @@ def create_agent_run(
 
     session_id = f"hermes-{agent_name}-{issue_id}-{run_id}"
 
-    # Write system prompt to file (hermes supports --system-prompt-file)
-    system_path = _write_file(run_id, "system", _RUNNER_SYSTEM_PROMPT)
-
     def _run():
         try:
             logger.info("Hermes session %s starting for run %d", session_id, run_id)
 
             # hermes chat -q "..." runs in single-query mode (non-interactive).
-            # --system-prompt-file sets the system prompt from our file.
+            # System prompt is injected via HERMES_EPHEMERAL_SYSTEM_PROMPT env var
+            # (hermes chat has no --system-prompt-file flag).
             # --toolsets terminal enables only the terminal tool.
             # --quiet suppresses UI chrome (banner, spinner).
+            # --yolo bypasses command approval prompts (we trust the runner).
             result = subprocess.run(
                 [
                     "hermes", "chat",
-                    "--system-prompt-file", system_path,
                     "--toolsets", "terminal",
                     "--quiet",
+                    "--yolo",
                     "-q", task_message,
                 ],
                 capture_output=True,
                 text=True,
                 timeout=3600,  # 1 hour max per run
+                env=_hermes_env(),
             )
 
             response = result.stdout.strip()
@@ -199,11 +197,6 @@ def create_agent_run(
             state.fail_run(run_id)
         finally:
             _active_threads.pop(run_id, None)
-            # Clean up temp file
-            try:
-                os.unlink(system_path)
-            except OSError:
-                pass
 
     thread = threading.Thread(target=_run, name=session_id, daemon=True)
     _active_threads[run_id] = thread
