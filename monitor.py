@@ -52,14 +52,18 @@ def _cleanup_run_worktree(run) -> None:
 
 
 async def _startup_recovery():
-    """On startup: reconcile DB state with live Hermes sessions."""
+    """On startup: reconcile DB state with live tmux windows / Hermes sessions."""
     active_runs = state.get_active_runs()
+    live_windows = set(hermes_spawn.list_windows())
 
     for run in active_runs:
         run_id = run["id"]
-        # Check if the Hermes session thread is still alive
-        if not hermes_spawn.is_session_alive(run_id):
-            logger.warning("Orphaned run %d (Hermes session gone) — marking failed", run_id)
+        window = run["tmux_window"]
+        # Check both: tmux window exists AND monitor thread alive
+        window_alive = window and window in live_windows
+        thread_alive = hermes_spawn.is_session_alive(run_id)
+        if not window_alive and not thread_alive:
+            logger.warning("Orphaned run %d (window %s gone) — marking failed", run_id, window)
             state.fail_run(run_id)
             _cleanup_run_worktree(run)
 
@@ -80,15 +84,15 @@ async def _poll():
         issue_number = run["issue_number"]
         repo = run["repo"]
 
-        # --- Hermes session health check ---
-        # If the Hermes thread died without signaling (crash, OOM, etc.),
-        # mark the run as failed so the queue unblocks.
-        if not hermes_spawn.is_session_alive(run_id):
-            # The Hermes session already called complete_run/fail_run on exit.
-            # If the run is still 'active' in DB but the thread is gone,
-            # it means the signal didn't land — mark failed.
+        # --- Session health check ---
+        # If both the tmux window and monitor thread are gone but the run
+        # is still active in DB, the completion signal didn't land.
+        window = run["tmux_window"]
+        window_alive = window and window in hermes_spawn.list_windows()
+        thread_alive = hermes_spawn.is_session_alive(run_id)
+        if not window_alive and not thread_alive:
             logger.warning(
-                "Run %d (%s on #%s) — Hermes session thread gone, marking failed",
+                "Run %d (%s on #%s) — window and thread gone, marking failed",
                 run_id, agent, issue_number,
             )
             state.fail_run(run_id, new_status="failed")

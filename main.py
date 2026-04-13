@@ -11,6 +11,7 @@ import logging
 import uvicorn
 
 import state
+import hermes_spawn
 from webhook import app
 
 logging.basicConfig(
@@ -24,6 +25,10 @@ async def _run_all():
     # Initialize state DB
     state.init_db()
     logger.info("State DB initialized")
+
+    # Ensure tmux session exists (hermes runs inside tmux for observability)
+    hermes_spawn.ensure_session()
+    logger.info("tmux session ready")
 
     # Start monitor loop
     monitor_task = asyncio.create_task(

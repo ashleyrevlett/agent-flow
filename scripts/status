@@ -76,20 +76,20 @@ def main():
         flag_str = f"  ({', '.join(flags)})" if flags else ""
         print(f"  #{issue['issue_number']:4d}  {issue['stage']:16s}{flag_str}")
 
-    # --- Hermes sessions ---
+    # --- tmux windows (hermes sessions run inside tmux for observability) ---
     print()
-    print("HERMES SESSIONS")
+    print("TMUX WINDOWS")
     print("-" * 50)
     try:
         import hermes_spawn
-        sessions = hermes_spawn.get_active_sessions()
-        if sessions:
-            for rid in sessions:
-                print(f"  run {rid} (thread alive)")
+        windows = hermes_spawn.list_windows()
+        if windows:
+            for w in windows:
+                print(f"  {w}")
         else:
             print("  (none)")
-    except ImportError:
-        print("  (hermes_spawn not available)")
+    except FileNotFoundError:
+        print("  (tmux not available)")
 
     # --- Recent completed/failed runs ---
     print()
