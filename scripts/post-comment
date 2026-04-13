@@ -8,9 +8,12 @@ The file content is passed safely to the CLI without shell interpolation.
 """
 
 import argparse
+import json
 import os
 import subprocess
 import sys
+import tempfile
+import urllib.parse
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -18,6 +21,15 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from config import GIT_PROVIDER, GIT_BASE_URL, API_TOKEN
+
+
+def _gitlab_env() -> dict[str, str]:
+    env = dict(os.environ)
+    if API_TOKEN and "GITLAB_TOKEN" not in env:
+        env["GITLAB_TOKEN"] = API_TOKEN
+    if GIT_BASE_URL:
+        env["GITLAB_HOST"] = GIT_BASE_URL
+    return env
 
 
 def main():
@@ -34,9 +46,8 @@ def main():
         print("Error: comment file is empty", file=sys.stderr)
         sys.exit(1)
 
-    env = dict(os.environ)
-
     if GIT_PROVIDER == "github":
+        env = dict(os.environ)
         if API_TOKEN and "GH_TOKEN" not in env and "GITHUB_TOKEN" not in env:
             env["GH_TOKEN"] = API_TOKEN
         if GIT_BASE_URL:
@@ -49,23 +60,33 @@ def main():
         )
 
     elif GIT_PROVIDER == "gitlab":
-        if API_TOKEN and "GITLAB_TOKEN" not in env:
-            env["GITLAB_TOKEN"] = API_TOKEN
-        if GIT_BASE_URL:
-            env["GITLAB_HOST"] = GIT_BASE_URL
-
-        # glab has no --body-file; use the API with --input to avoid shell quoting
-        import json
-        import urllib.parse
+        env = _gitlab_env()
         encoded_repo = urllib.parse.quote_plus(args.repo)
-        payload = json.dumps({"body": body})
+        endpoint = f"projects/{encoded_repo}/issues/{args.issue}/notes"
 
-        result = subprocess.run(
-            ["glab", "api", "--method", "POST",
-             f"projects/{encoded_repo}/issues/{args.issue}/notes",
-             "--input", "-"],
-            input=payload, env=env, capture_output=True, text=True,
-        )
+        # Write JSON payload to a temp file and pass via --input.
+        # Using --input with a file path is more reliable than piping stdin
+        # (avoids HTTP 415 Content-Type issues with some glab versions).
+        payload = json.dumps({"body": body})
+        fd, json_path = tempfile.mkstemp(suffix=".json", prefix="comment-")
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(payload)
+
+            result = subprocess.run(
+                ["glab", "api", "--method", "POST", endpoint, "--input", json_path],
+                env=env, capture_output=True, text=True,
+            )
+
+            # Fallback: if --input fails, try --raw-field
+            if result.returncode != 0 and ("415" in result.stderr or "input" in result.stderr.lower()):
+                result = subprocess.run(
+                    ["glab", "api", "--method", "POST", endpoint,
+                     "--raw-field", f"body={body}"],
+                    env=env, capture_output=True, text=True,
+                )
+        finally:
+            os.unlink(json_path)
 
     else:
         print(f"Unknown GIT_PROVIDER: {GIT_PROVIDER}", file=sys.stderr)

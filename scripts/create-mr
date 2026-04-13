@@ -51,10 +51,12 @@ def main():
         if GIT_BASE_URL:
             env["GITLAB_HOST"] = GIT_BASE_URL
 
+        # --fill conflicts with --title/--description, so we don't use it.
+        # --push pushes the current branch before creating the MR.
         result = subprocess.run(
             ["glab", "mr", "create", "--repo", args.repo,
              "--title", args.title, "--description", body,
-             "--fill", "--push"],
+             "--push"],
             env=env, capture_output=True, text=True,
         )
 
