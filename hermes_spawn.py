@@ -75,32 +75,53 @@ def _build_task_message(
     cli_command: str,
     repo_path: str,
     prompt_file_path: str,
+    cli_window_name: str,
 ) -> str:
     """Build the one-shot task message that Hermes receives."""
+    session = TMUX_SESSION_NAME
+    target = f"{session}:{cli_window_name}"
     return f"""\
-Run this CLI tool and interact with it.
+You will manage a CLI tool running in a tmux window. Use tmux commands to \
+interact with it — do NOT run the CLI directly in your own terminal.
 
-Step 1 — Launch the CLI:
-Run this command with pty=true:
-```
-cd {repo_path} && {cli_command}
-```
+The tmux session is: {session}
+The CLI window is: {cli_window_name}
 
-Step 2 — Handle initialization:
-The CLI may show a trust/confirmation prompt. If so, accept it.
-Wait until the CLI is ready for input (you'll see a prompt like ">" or "$").
-
-Step 3 — Send the task:
-Once the CLI is ready, send it this exact text:
+Step 1 — Create the CLI window and launch the tool:
 ```
-Read and execute the task in {prompt_file_path}
+tmux new-window -t {session} -n {cli_window_name}
+tmux send-keys -t {target} 'cd {repo_path} && {cli_command}' Enter
 ```
 
-Step 4 — Monitor:
-Wait for the CLI process to finish. Do not interfere with its work.
-When it exits, report "DONE".
-If it appears stuck (no new output for 5 minutes), report "STUCK".
-If it crashes or shows a fatal error, report "ERROR: <brief description>".
+Step 2 — Wait for the CLI to initialize, then check for trust prompts:
+Wait a few seconds, then read the window:
+```
+sleep 5
+tmux capture-pane -t {target} -p -S -30
+```
+If you see a trust/confirmation prompt ("Do you trust", "Yes, continue", \
+"y/n"), dismiss it:
+- For "y/n" prompts: `tmux send-keys -t {target} y Enter`
+- For numbered menus with "Press enter": `tmux send-keys -t {target} Enter`
+
+Re-check the pane after dismissing to confirm the CLI is ready for input.
+
+Step 3 — Send the task instruction:
+Once the CLI shows an input prompt (like ">" or "$"):
+```
+tmux send-keys -t {target} 'Read and execute the task in {prompt_file_path}' Enter
+```
+
+Step 4 — Monitor until done:
+Periodically check the window (every 30-60 seconds):
+```
+tmux capture-pane -t {target} -p -S -50
+```
+- If the window no longer exists (`tmux has-window` fails), the CLI exited. Report "DONE".
+- If no new output for 5+ minutes, report "STUCK".
+- If you see a fatal error or crash, report "ERROR: <brief description>".
+
+Do NOT interfere with the CLI's work. Just watch and wait.
 """
 
 
@@ -167,22 +188,6 @@ def kill_window(window_name: str):
 _active_threads: dict[int, threading.Thread] = {}
 
 
-def _build_hermes_command(task_message: str) -> str:
-    """Build the full hermes chat shell command.
-
-    We need to escape the task message for shell embedding since it's
-    sent via tmux send-keys into a shell.
-    """
-    # Single-quote the task message to prevent shell interpretation.
-    # Escape any single quotes within the message.
-    escaped = task_message.replace("'", "'\\''")
-    return (
-        f"HERMES_EPHEMERAL_SYSTEM_PROMPT='{_RUNNER_SYSTEM_PROMPT.replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))}' "
-        f"hermes chat --toolsets terminal --quiet --yolo "
-        f"-q '{escaped}'"
-    )
-
-
 def create_agent_run(
     run_id: int,
     agent_name: str,
@@ -191,56 +196,60 @@ def create_agent_run(
     repo_path: str,
 ) -> str:
     """
-    Launch a Hermes agent session inside a tmux window.
-    Returns the window name (stored in state DB for monitoring).
+    Launch a Hermes agent session inside a tmux window. Hermes will create
+    a second tmux window for the actual CLI tool (Claude Code / Codex),
+    giving you visibility into both:
 
-    A background thread monitors the tmux window. When hermes exits
-    (window closes or process ends), the thread updates run state.
+      tmux attach -t agent-flow    → see all windows
+      Ctrl-b n/p                   → switch between hermes runner and CLI
+
+    Returns the hermes window name (stored in state DB for monitoring).
     """
     cli_command = _build_cli_command(agent_name, issue_id, run_id)
-    task_message = _build_task_message(agent_name, cli_command, repo_path, prompt_file_path)
-    window_name = f"hermes-{agent_name}-{issue_id}-{run_id}"
+    cli_window = f"{agent_name}-{issue_id}-{run_id}"
+    hermes_window = f"hermes-{agent_name}-{issue_id}-{run_id}"
+    task_message = _build_task_message(
+        agent_name, cli_command, repo_path, prompt_file_path, cli_window,
+    )
 
     # Ensure tmux session exists
     ensure_session()
 
-    # Create tmux window
-    _tmux(["new-window", "-t", TMUX_SESSION_NAME, "-n", window_name])
+    # Create the Hermes runner window
+    _tmux(["new-window", "-t", TMUX_SESSION_NAME, "-n", hermes_window])
 
-    # Build and send the hermes command
-    # Write the system prompt and task to temp files to avoid shell escaping hell
-    os.makedirs(os.path.join(os.path.dirname(__file__), "tmp"), exist_ok=True)
-    system_file = os.path.join(os.path.dirname(__file__), "tmp", f"sys-{run_id}.md")
-    task_file = os.path.join(os.path.dirname(__file__), "tmp", f"task-{run_id}.md")
+    # Write system prompt and task to temp files to avoid shell escaping
+    tmp_dir = os.path.join(os.path.dirname(__file__), "tmp")
+    os.makedirs(tmp_dir, exist_ok=True)
+    system_file = os.path.join(tmp_dir, f"sys-{run_id}.md")
+    task_file = os.path.join(tmp_dir, f"task-{run_id}.md")
     with open(system_file, "w") as f:
         f.write(_RUNNER_SYSTEM_PROMPT)
     with open(task_file, "w") as f:
         f.write(task_message)
 
-    # Construct a shell command that reads from files — no escaping needed
+    # Launch hermes in the window — reads prompts from files
     hermes_cmd = (
         f"export HERMES_EPHEMERAL_SYSTEM_PROMPT=\"$(cat {system_file})\" && "
         f"hermes chat --toolsets terminal --quiet --yolo "
         f"-q \"$(cat {task_file})\""
     )
+    _tmux(["send-keys", "-t", f"{TMUX_SESSION_NAME}:{hermes_window}", hermes_cmd, "Enter"])
 
-    # Send the command to the tmux window
-    _tmux(["send-keys", "-t", f"{TMUX_SESSION_NAME}:{window_name}", hermes_cmd, "Enter"])
-
-    # Start monitor thread
+    # Start monitor thread — watches the hermes window
     def _monitor():
         try:
-            logger.info("Monitoring Hermes window %s for run %d", window_name, run_id)
+            logger.info("Monitoring Hermes window %s for run %d", hermes_window, run_id)
 
-            # Poll until the window disappears (hermes exited)
-            while _window_exists(window_name):
+            while _window_exists(hermes_window):
                 time.sleep(5)
 
-            # Window gone — hermes exited. Check final pane output
-            # (window is gone so we can't capture; rely on exit behavior)
-            logger.info("Hermes window %s closed for run %d", window_name, run_id)
+            logger.info("Hermes window %s closed for run %d", hermes_window, run_id)
 
-            # Signal completion
+            # Also clean up the CLI window if hermes left it behind
+            if _window_exists(cli_window):
+                kill_window(cli_window)
+
             import state
             state.complete_run(run_id)
 
@@ -250,19 +259,18 @@ def create_agent_run(
             state.fail_run(run_id)
         finally:
             _active_threads.pop(run_id, None)
-            # Clean up temp files
             for p in (system_file, task_file):
                 try:
                     os.unlink(p)
                 except OSError:
                     pass
 
-    thread = threading.Thread(target=_monitor, name=window_name, daemon=True)
+    thread = threading.Thread(target=_monitor, name=hermes_window, daemon=True)
     _active_threads[run_id] = thread
     thread.start()
 
-    logger.info("Spawned Hermes in tmux window: %s", window_name)
-    return window_name
+    logger.info("Spawned Hermes window: %s (CLI will appear as: %s)", hermes_window, cli_window)
+    return hermes_window
 
 
 def is_session_alive(run_id: int) -> bool:
@@ -277,12 +285,15 @@ def get_active_sessions() -> list[int]:
 
 
 def kill_session(run_id: int):
-    """Kill a Hermes session by killing its tmux window."""
+    """Kill a Hermes session by killing its tmux windows (hermes + CLI)."""
     import state
     thread = _active_threads.pop(run_id, None)
     if thread:
-        # Find the window name from the thread name
-        window_name = thread.name
-        kill_window(window_name)
-        logger.info("Killed Hermes session for run %d (window %s)", run_id, window_name)
+        hermes_window = thread.name
+        # Derive CLI window name: strip "hermes-" prefix
+        cli_window = hermes_window.replace("hermes-", "", 1)
+        kill_window(hermes_window)
+        if _window_exists(cli_window):
+            kill_window(cli_window)
+        logger.info("Killed Hermes session for run %d (windows: %s, %s)", run_id, hermes_window, cli_window)
         state.fail_run(run_id, new_status="failed")
