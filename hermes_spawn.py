@@ -1,5 +1,5 @@
 """
-hermes_spawn.py — Agent spawning via Hermes Agent. Replaces tmux send-keys
+hermes_spawn.py — Agent spawning via Hermes CLI. Replaces tmux send-keys
 with interactive Hermes sessions that can handle trust prompts, errors,
 and bidirectional CLI interaction.
 
@@ -7,21 +7,22 @@ Hermes is a reactive executor — it runs the CLI, handles interactive prompts,
 and reports completion. It does NOT make pipeline decisions. Python owns the
 state machine and all routing logic.
 
-Tmux windows are still created for observability (tmux attach to watch),
-but Hermes manages the actual CLI interaction via its terminal tool with
-PTY support.
+Uses the `hermes` CLI (not the Python API) since Hermes is installed
+separately from agent-flow's Python environment.
 """
 
 import logging
+import os
+import subprocess
 import threading
 from pathlib import Path
 from typing import Optional
 
-from config import TMUX_SESSION_NAME, ROLES_DIR
+from config import ROLES_DIR, TMP_DIR
 
 logger = logging.getLogger(__name__)
 
-# Map agent names to their role files (used as context for Hermes)
+# Map agent names to their role files
 _AGENT_ROLES = {
     "claude": "planner",
     "implementer": "implementer",
@@ -85,7 +86,7 @@ def _build_task_message(
 ) -> str:
     """Build the one-shot task message that Hermes receives."""
     return f"""\
-Run this CLI tool in a tmux window for observability, then interact with it.
+Run this CLI tool and interact with it.
 
 Step 1 — Launch the CLI:
 Run this command with pty=true:
@@ -115,6 +116,15 @@ If it crashes or shows a fatal error, report "ERROR: <brief description>".
 _active_threads: dict[int, threading.Thread] = {}
 
 
+def _write_file(run_id: int, name: str, content: str) -> str:
+    """Write content to a temp file. Returns the path."""
+    os.makedirs(TMP_DIR, exist_ok=True)
+    path = os.path.join(TMP_DIR, f"hermes-{name}-{run_id}.md")
+    with open(path, "w") as f:
+        f.write(content)
+    return path
+
+
 def create_agent_run(
     run_id: int,
     agent_name: str,
@@ -124,51 +134,76 @@ def create_agent_run(
 ) -> str:
     """
     Launch a Hermes agent session to run the specified CLI tool.
-    Returns a session identifier (used as tmux_window equivalent in state DB).
+    Returns a session identifier (stored as tmux_window equivalent in state DB).
 
-    The Hermes agent runs in a background thread. When agent.chat() returns,
-    the run is complete — dispatch/monitor handles the rest.
+    The Hermes CLI runs in a background thread. When it exits, the run is
+    complete — the thread updates state accordingly.
     """
-    from run_agent import AIAgent
-
     cli_command = _build_cli_command(agent_name, issue_id, run_id)
     task_message = _build_task_message(agent_name, cli_command, repo_path, prompt_file_path)
 
     session_id = f"hermes-{agent_name}-{issue_id}-{run_id}"
 
+    # Write system prompt to file (hermes supports --system-prompt-file)
+    system_path = _write_file(run_id, "system", _RUNNER_SYSTEM_PROMPT)
+
     def _run():
         try:
             logger.info("Hermes session %s starting for run %d", session_id, run_id)
 
-            agent = AIAgent(
-                model="anthropic/claude-sonnet-4-5-20250514",
-                ephemeral_system_prompt=_RUNNER_SYSTEM_PROMPT,
-                enabled_toolsets=["terminal"],
-                max_iterations=30,
+            # hermes chat -q "..." runs in single-query mode (non-interactive).
+            # --system-prompt-file sets the system prompt from our file.
+            # --toolsets terminal enables only the terminal tool.
+            # --quiet suppresses UI chrome (banner, spinner).
+            result = subprocess.run(
+                [
+                    "hermes", "chat",
+                    "--system-prompt-file", system_path,
+                    "--toolsets", "terminal",
+                    "--quiet",
+                    "-q", task_message,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=3600,  # 1 hour max per run
             )
 
-            response = agent.chat(task_message)
-
+            response = result.stdout.strip()
             logger.info(
-                "Hermes session %s completed for run %d: %s",
-                session_id, run_id, response[:200] if response else "(no response)",
+                "Hermes session %s completed for run %d (exit=%d): %s",
+                session_id, run_id, result.returncode,
+                response[-200:] if response else "(no output)",
             )
 
-            # Signal completion — import here to avoid circular import
+            if result.stderr:
+                logger.warning("Hermes stderr for run %d: %s", run_id, result.stderr[-500:])
+
+            # Signal completion
             import state
-            if response and "ERROR" in response:
+            if result.returncode != 0:
                 state.fail_run(run_id, new_status="failed")
-            elif response and "STUCK" in response:
+            elif "ERROR" in response:
+                state.fail_run(run_id, new_status="failed")
+            elif "STUCK" in response:
                 state.fail_run(run_id, new_status="stuck")
             else:
                 state.complete_run(run_id)
 
+        except subprocess.TimeoutExpired:
+            logger.error("Hermes session %s timed out for run %d", session_id, run_id)
+            import state
+            state.fail_run(run_id, new_status="stuck")
         except Exception:
             logger.exception("Hermes session %s crashed for run %d", session_id, run_id)
             import state
             state.fail_run(run_id)
         finally:
             _active_threads.pop(run_id, None)
+            # Clean up temp file
+            try:
+                os.unlink(system_path)
+            except OSError:
+                pass
 
     thread = threading.Thread(target=_run, name=session_id, daemon=True)
     _active_threads[run_id] = thread
@@ -193,8 +228,7 @@ def kill_session(run_id: int):
     """Best-effort kill of a Hermes session.
 
     Hermes agent threads are daemon threads — they'll die when the process exits.
-    For explicit kill, we can't safely kill a thread in Python, but we can
-    mark the run as failed so the queue unblocks.
+    For explicit kill, we mark the run as failed so the queue unblocks.
     """
     import state
     thread = _active_threads.pop(run_id, None)
