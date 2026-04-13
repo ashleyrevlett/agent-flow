@@ -2,5 +2,4 @@ fastapi
 uvicorn[standard]
 httpx
 pydantic-settings
-python-telegram-bot
 python-dotenv

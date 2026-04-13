@@ -27,7 +27,10 @@ GITHUB_TOKEN: str = API_TOKEN
 GITHUB_REPO: str = GIT_REPO
 BOT_GITHUB_USERNAME: str = BOT_USERNAME
 
-# Telegram
+# Hermes gateway (handles Telegram communication)
+HERMES_GATEWAY_URL: str = os.getenv("HERMES_GATEWAY_URL", "http://127.0.0.1:8642")
+
+# Legacy Telegram settings (kept for reference, no longer used directly)
 TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
 

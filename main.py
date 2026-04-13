@@ -1,5 +1,8 @@
 """
-main.py — Entry point. Starts FastAPI, monitor loop, and Telegram bot.
+main.py — Entry point. Starts FastAPI webhook server and monitor loop.
+
+Telegram communication is handled by the Hermes gateway (run separately
+via `hermes gateway start`). Pipeline events are sent to the gateway API.
 """
 
 import asyncio
@@ -8,9 +11,6 @@ import logging
 import uvicorn
 
 import state
-import spawn
-import notifications as telegram
-from config import TMUX_SESSION_NAME
 from webhook import app
 
 logging.basicConfig(
@@ -25,20 +25,10 @@ async def _run_all():
     state.init_db()
     logger.info("State DB initialized")
 
-    # Ensure tmux session exists
-    spawn.ensure_session()
-    logger.info("tmux session ready: %s", TMUX_SESSION_NAME)
-
     # Start monitor loop
     monitor_task = asyncio.create_task(
         _run_monitor(),
         name="monitor",
-    )
-
-    # Start Telegram bot
-    telegram_task = asyncio.create_task(
-        telegram.start_bot(),
-        name="telegram-bot",
     )
 
     # Start FastAPI via uvicorn
@@ -56,7 +46,7 @@ async def _run_all():
 
     # Run until any task exits (crash = restart the whole process)
     done, pending = await asyncio.wait(
-        {monitor_task, telegram_task, server_task},
+        {monitor_task, server_task},
         return_when=asyncio.FIRST_EXCEPTION,
     )
 
