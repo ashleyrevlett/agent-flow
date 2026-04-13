@@ -76,10 +76,12 @@ def _build_task_message(
     repo_path: str,
     prompt_file_path: str,
     cli_window_name: str,
+    git_provider: str,
 ) -> str:
     """Build the one-shot task message that Hermes receives."""
     session = TMUX_SESSION_NAME
     target = f"{session}:{cli_window_name}"
+    provider = git_provider
     return f"""\
 You will manage a CLI tool running in a tmux window. Use tmux commands to \
 interact with it — do NOT run the CLI directly in your own terminal.
@@ -97,6 +99,14 @@ CRITICAL tmux send-keys rules:
 the pane and checking the output changed. If the text appears but was not \
 submitted (no new output below it), send a bare Enter:
   tmux send-keys -t {target} Enter
+
+IMPORTANT — Git provider:
+This repo uses **{provider}** (not {"github" if provider == "gitlab" else "gitlab"}).
+- Use `{"glab" if provider == "gitlab" else "gh"}` CLI commands, NOT `{"gh" if provider == "gitlab" else "glab"}`.
+- The CLI tool running in the window may try to use the wrong CLI. If you \
+see it attempting to use `{"gh" if provider == "gitlab" else "glab"}` commands, that is an error \
+in the tool's behavior — you cannot fix it, but be aware.
+- You can verify by running: `git -C {repo_path} remote -v`
 
 Step 1 — Create the CLI window and launch the tool:
 ```
@@ -225,8 +235,9 @@ def create_agent_run(
     cli_command = _build_cli_command(agent_name, issue_id, run_id)
     cli_window = f"{agent_name}-{issue_id}-{run_id}"
     hermes_window = f"hermes-{agent_name}-{issue_id}-{run_id}"
+    from config import GIT_PROVIDER
     task_message = _build_task_message(
-        agent_name, cli_command, repo_path, prompt_file_path, cli_window,
+        agent_name, cli_command, repo_path, prompt_file_path, cli_window, GIT_PROVIDER,
     )
 
     # Ensure tmux session exists
