@@ -1,10 +1,16 @@
 """
-monitor.py — Periodic pane health checks, completion/stuck detection,
-circuit breaker management, restart recovery.
+monitor.py — Periodic health checks, completion detection via comment polling,
+circuit breaker management, and restart recovery.
+
+With Hermes-based spawning, idle/error detection is handled by the Hermes agent
+itself. Monitor focuses on:
+- GitHub/GitLab comment polling (primary completion signal for terminal statuses)
+- Circuit breaker expiry
+- Startup recovery (reconcile DB with live Hermes sessions)
+- Worktree cleanup
 """
 
 import asyncio
-import hashlib
 import logging
 import re
 from datetime import datetime, timezone
@@ -12,30 +18,16 @@ from typing import Optional
 
 import state
 import spawn
+import hermes_spawn
 import notifications as telegram
 from config import (
     MONITOR_POLL_SECONDS,
-    IDLE_TIMEOUT_SECONDS,
 )
 from provider import get_provider
 
 logger = logging.getLogger(__name__)
 
 _provider = get_provider()
-
-# Track pane content hashes and last-change timestamps per run_id
-_pane_hashes: dict[int, str] = {}
-_pane_last_changed: dict[int, float] = {}
-
-# Error patterns that indicate a failed or rate-limited agent
-_ERROR_PATTERNS = re.compile(
-    r"Error:|Traceback|FATAL|rate limit|authentication failed|401 Unauthorized",
-    re.IGNORECASE,
-)
-_RATE_LIMIT_PATTERNS = re.compile(
-    r"rate limit|429|too many requests|authentication failed|401",
-    re.IGNORECASE,
-)
 
 
 async def monitor_loop():
@@ -60,21 +52,16 @@ def _cleanup_run_worktree(run) -> None:
 
 
 async def _startup_recovery():
-    """On startup: reconcile DB state with actual tmux windows."""
+    """On startup: reconcile DB state with live Hermes sessions."""
     active_runs = state.get_active_runs()
-    live_windows = set(spawn.list_windows())
 
     for run in active_runs:
         run_id = run["id"]
-        window = run["tmux_window"]
-        if window and window not in live_windows:
-            logger.warning("Orphaned run %d (window %s gone) — marking failed", run_id, window)
+        # Check if the Hermes session thread is still alive
+        if not hermes_spawn.is_session_alive(run_id):
+            logger.warning("Orphaned run %d (Hermes session gone) — marking failed", run_id)
             state.fail_run(run_id)
             _cleanup_run_worktree(run)
-        else:
-            # Re-register in our tracking dicts
-            import time
-            _pane_last_changed[run_id] = time.time()
 
     # Drain queues — pick up any work that was queued before restart
     for agent in ("claude", "implementer", "codex"):
@@ -83,8 +70,6 @@ async def _startup_recovery():
 
 
 async def _poll():
-    import time
-
     active_runs = state.get_active_runs()
     if not active_runs:
         return
@@ -94,73 +79,32 @@ async def _poll():
         agent = run["agent"]
         issue_number = run["issue_number"]
         repo = run["repo"]
-        window = run["tmux_window"]
 
-        if not window:
-            continue
-
-        # --- Pane health check ---
-        pane_content = spawn.capture_pane(window)
-        content_hash = hashlib.md5(pane_content.encode()).hexdigest()
-
-        if content_hash != _pane_hashes.get(run_id):
-            _pane_hashes[run_id] = content_hash
-            _pane_last_changed[run_id] = time.time()
-
-        idle_seconds = time.time() - _pane_last_changed.get(run_id, time.time())
-
-        # --- Stuck detection ---
-        if idle_seconds >= IDLE_TIMEOUT_SECONDS:
+        # --- Hermes session health check ---
+        # If the Hermes thread died without signaling (crash, OOM, etc.),
+        # mark the run as failed so the queue unblocks.
+        if not hermes_spawn.is_session_alive(run_id):
+            # The Hermes session already called complete_run/fail_run on exit.
+            # If the run is still 'active' in DB but the thread is gone,
+            # it means the signal didn't land — mark failed.
             logger.warning(
-                "Run %d (%s on #%s) stuck for %.0fs — alerting",
-                run_id, agent, issue_number, idle_seconds,
+                "Run %d (%s on #%s) — Hermes session thread gone, marking failed",
+                run_id, agent, issue_number,
             )
-            state.fail_run(run_id, new_status="stuck")
+            state.fail_run(run_id, new_status="failed")
             _cleanup_run_worktree(run)
-            telegram.send_stuck_alert(
-                agent=agent,
-                window=window,
-                excerpt=pane_content[-500:],
-            )
-            continue
-
-        # --- Error detection ---
-        if _ERROR_PATTERNS.search(pane_content):
-            if _RATE_LIMIT_PATTERNS.search(pane_content):
-                logger.warning("Circuit breaker trip: rate limit/auth error for %s", agent)
-                state.trip_breaker(agent)
-                # Mark run failed so try_promote() is not permanently blocked
-                # waiting for an active run that will never complete.
-                state.fail_run(run_id, new_status="failed")
-                _cleanup_run_worktree(run)
-                resume_at = _get_breaker_resume(agent)
-                telegram.send_notification(
-                    f"Circuit breaker tripped for @{agent} — rate limited. Resuming at {resume_at}.",
-                    issue_url=_provider.issue_url(repo, issue_number),
-                )
-            else:
-                excerpt = _extract_error(pane_content)
-                logger.error("Error detected in run %d (%s): %s", run_id, agent, excerpt[:200])
-                state.fail_run(run_id, new_status="failed")
-                _cleanup_run_worktree(run)
-                telegram.send_stuck_alert(
-                    agent=agent,
-                    window=window,
-                    excerpt=excerpt,
-                )
             continue
 
         # --- Circuit breaker expiry ---
         if state.is_breaker_tripped(agent):
-            # Check if it's time to reset
-            # (resume_at comparison is done inside is_breaker_tripped)
             pass
         else:
-            # Proactively reset if breaker was previously tripped but has now expired
             _try_reset_breaker(agent)
 
         # --- Comment polling (primary completion signal) ---
-        # Claude Code uses alt-screen; pane exit is unreliable. Poll git platform instead.
+        # The Hermes agent handles CLI interaction and calls complete_run/fail_run
+        # when done. But some terminal statuses (APPROVED, DECOMPOSED) are detected
+        # via GitHub/GitLab comments because they have no @mention for dispatch.
         iso_started_at = _sqlite_ts_to_iso(run["started_at"])
         completed, status_token = _provider.check_completion(
             repo, issue_number, agent, iso_started_at
@@ -206,17 +150,7 @@ def _sqlite_ts_to_iso(ts: str) -> str:
         dt = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
         return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
     except ValueError:
-        # Already ISO or unrecognised — return as-is and let JQ decide.
         return ts
-
-
-def _extract_error(pane_content: str) -> str:
-    """Return the last 800 chars of pane around the first error pattern."""
-    match = _ERROR_PATTERNS.search(pane_content)
-    if not match:
-        return pane_content[-500:]
-    start = max(0, match.start() - 100)
-    return pane_content[start:start + 800]
 
 
 def _get_breaker_resume(agent: str) -> str:
@@ -235,7 +169,6 @@ def _try_reset_breaker(agent: str):
             (agent,),
         ).fetchone()
     if row:
-        from datetime import datetime, timezone
         if row["resume_at"] <= datetime.now(timezone.utc).isoformat():
             state.reset_breaker(agent)
             logger.info("Circuit breaker reset for %s", agent)

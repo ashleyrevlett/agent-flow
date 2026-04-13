@@ -18,7 +18,8 @@ from provider import WebhookEvent, get_provider
 from prompts import planner as planner_prompt
 from prompts import implementer as implementer_prompt
 from prompts import reviewer as reviewer_prompt
-import spawn
+import spawn  # worktree management (git, not tmux)
+import hermes_spawn
 import notifications as telegram
 
 logger = logging.getLogger(__name__)
@@ -363,7 +364,7 @@ def _dispatch_agent(
 
 
 def _spawn_run(run):
-    """Spawn a promoted run into a tmux window."""
+    """Spawn a promoted run via Hermes agent session."""
     from config import REPO_LOCAL_PATH
     run_id = run["id"]
     agent = run["agent"]
@@ -390,15 +391,16 @@ def _spawn_run(run):
     else:
         repo_path = REPO_LOCAL_PATH
 
-    window_name = spawn.create_agent_window(
+    # Launch via Hermes — handles trust prompts, monitors CLI, signals completion
+    session_id = hermes_spawn.create_agent_run(
         run_id=run_id,
         agent_name=agent,
         issue_id=issue_id,
         prompt_file_path=prompt_file,
         repo_path=repo_path,
     )
-    state.update_run_window(run_id, window_name)
-    logger.info("Spawned run %d → window %s", run_id, window_name)
+    state.update_run_window(run_id, session_id)
+    logger.info("Spawned run %d → Hermes session %s", run_id, session_id)
 
 
 # ---------------------------------------------------------------------------
