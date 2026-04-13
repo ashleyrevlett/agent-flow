@@ -87,6 +87,17 @@ interact with it — do NOT run the CLI directly in your own terminal.
 The tmux session is: {session}
 The CLI window is: {cli_window_name}
 
+CRITICAL tmux send-keys rules:
+- ALWAYS pass Enter as a SEPARATE ARGUMENT, never as part of the text string.
+- CORRECT:   tmux send-keys -t {target} 'some text' Enter
+- WRONG:     tmux send-keys -t {target} 'some text\\n'
+- WRONG:     tmux send-keys -t {target} 'some text' 'Enter'
+- The word Enter must be an unquoted bare argument at the end of the command.
+- After sending text + Enter, ALWAYS verify it was received by capturing \
+the pane and checking the output changed. If the text appears but was not \
+submitted (no new output below it), send a bare Enter:
+  tmux send-keys -t {target} Enter
+
 Step 1 — Create the CLI window and launch the tool:
 ```
 tmux new-window -t {session} -n {cli_window_name}
@@ -110,6 +121,12 @@ Step 3 — Send the task instruction:
 Once the CLI shows an input prompt (like ">" or "$"):
 ```
 tmux send-keys -t {target} 'Read and execute the task in {prompt_file_path}' Enter
+```
+Then verify the instruction was submitted — capture the pane and check for \
+new output. If the text is visible but the CLI hasn't started processing \
+(no activity below the pasted text), send a bare Enter to submit:
+```
+tmux send-keys -t {target} Enter
 ```
 
 Step 4 — Monitor until done:
